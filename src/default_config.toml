@@ -1,0 +1,5 @@
+# Author: https://443eb9.dev
+# Github: https://github.com/443eb9/screen_filter
+
+hotkey = "c" # Global hotkey to toggle filter
+mode = "OklabGrayscale" # OklabGrayscale, LabGrayscale

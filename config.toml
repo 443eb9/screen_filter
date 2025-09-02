@@ -1,0 +1,2 @@
+hotkey = "ctrl+alt+c" # Global hotkey to toggle filter
+mode = "OklabGrayscale" # OklabGrayscale, LabGrayscale

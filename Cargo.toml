@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-lazy_static = "1"
-log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.9"
+win-hotkey = "0.3"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dxgi",
