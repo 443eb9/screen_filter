@@ -1,6 +1,8 @@
+#![windows_subsystem = "windows"]
+
 use std::sync::atomic::Ordering;
 
-use win_hotkey::{HotkeyManager, HotkeyManagerImpl, keys::VirtualKey};
+use win_hotkey::{HotkeyManager, HotkeyManagerImpl};
 
 use crate::render::ENABLED;
 
