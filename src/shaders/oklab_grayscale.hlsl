@@ -8,6 +8,13 @@ float gamma_to_linear(float x) {
     return pow((x + 0.055) / 1.055, 2.4);
 }
 
+float toe(float x) {
+    const float K1 = 0.206;
+    const float K2 = 0.03;
+    const float K3 = (1.0 + K1) / (1.0 + K2);
+    return 0.5 * (K3 * x - K1 + sqrt((K3 * x - K1) * (K3 * x - K1) + 4.0 * K2 * K3 * x));
+}
+
 float4 main(float4 pos : SV_Position, float2 tex : TEXCOORD) : SV_Target {
     float4 color = screenTexture.Sample(samplerState, tex);
     float red = gamma_to_linear(color.r);
@@ -21,6 +28,7 @@ float4 main(float4 pos : SV_Position, float2 tex : TEXCOORD) : SV_Target {
     float m_ = pow(m, 1.0 / 3.0);
     float s_ = pow(s, 1.0 / 3.0);
     float okl = 0.21045426 * l_ + 0.7936178 * m_ - 0.004072047 * s_;
+    okl = toe(okl);
 
     return float4(okl, okl, okl, 1.0f);
 }

@@ -25,7 +25,10 @@ fn main() {
     let fragment = config.mode.fragment_shader();
 
     std::thread::spawn(|| {
-        render::render_loop(fragment).unwrap();
+        match render::render_loop(fragment) {
+            Ok(_) => {}
+            Err(err) => println!("Render loop error: {}", err),
+        };
     });
 
     let (vk, mods) = config.parse_hotkey().unwrap();
