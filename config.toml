@@ -1,6 +1,0 @@
-# Author: https://443eb9.dev
-# Github: https://github.com/443eb9/screen_filter
-
-hotkey = "ctrl+alt+c"
-mode = "OklabGrayscale"  # Options: OklabGrayscale, LabGrayscale
-launch_on_startup = true

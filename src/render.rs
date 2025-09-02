@@ -72,7 +72,6 @@ void main(in float2 pos : POSITION, in float2 tex : TEXCOORD,
 
 pub fn render_loop(fragment: &'static str) -> windows::core::Result<()> {
     unsafe {
-        // 注册窗口类
         let hinstance = GetModuleHandleA(None)?;
         let class_name = s!("DX11ScreenFilter");
 
@@ -106,7 +105,6 @@ pub fn render_loop(fragment: &'static str) -> windows::core::Result<()> {
             None,
         )?;
 
-        // 避免被系统截图捕获（与原版一致）
         let _ = SetWindowDisplayAffinity(hWnd, WDA_EXCLUDEFROMCAPTURE);
         SetLayeredWindowAttributes(hWnd, COLORREF(0), 255, LWA_ALPHA)?;
 
@@ -145,7 +143,6 @@ unsafe fn init_d3d11(hWnd: HWND) -> windows::core::Result<Globals> {
         let virt_w = GetSystemMetrics(SM_CXVIRTUALSCREEN) as u32;
         let virt_h = GetSystemMetrics(SM_CYVIRTUALSCREEN) as u32;
 
-        // 交换链描述
         let mut sd: DXGI_SWAP_CHAIN_DESC = zeroed();
         sd.BufferCount = 1;
         sd.BufferDesc = DXGI_MODE_DESC {
@@ -167,7 +164,6 @@ unsafe fn init_d3d11(hWnd: HWND) -> windows::core::Result<Globals> {
         sd.Windowed = BOOL(1);
         sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
 
-        // 创建设备+上下文+交换链
         let mut device: Option<ID3D11Device> = None;
         let mut ctx: Option<ID3D11DeviceContext> = None;
         let mut swap_chain: Option<IDXGISwapChain> = None;
@@ -193,7 +189,6 @@ unsafe fn init_d3d11(hWnd: HWND) -> windows::core::Result<Globals> {
         let ctx = ctx.unwrap();
         let swap_chain = swap_chain.unwrap();
 
-        // RTV
         let backbuf = swap_chain.GetBuffer::<ID3D11Texture2D>(0)?;
 
         let rtv = {
@@ -203,7 +198,6 @@ unsafe fn init_d3d11(hWnd: HWND) -> windows::core::Result<Globals> {
         };
         ctx.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
 
-        // 视口
         let vp = D3D11_VIEWPORT {
             TopLeftX: 0.0,
             TopLeftY: 0.0,
@@ -214,7 +208,6 @@ unsafe fn init_d3d11(hWnd: HWND) -> windows::core::Result<Globals> {
         };
         ctx.RSSetViewports(Some(&[vp]));
 
-        // Sampler
         let sampler = {
             let desc = D3D11_SAMPLER_DESC {
                 Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
@@ -230,7 +223,6 @@ unsafe fn init_d3d11(hWnd: HWND) -> windows::core::Result<Globals> {
             s.unwrap()
         };
 
-        // Shaders + InputLayout
         let (vs, input_layout) = {
             let mut vs_blob: Option<ID3DBlob> = None;
             let mut err_blob: Option<ID3DBlob> = None;
@@ -285,7 +277,6 @@ unsafe fn init_d3d11(hWnd: HWND) -> windows::core::Result<Globals> {
             (vs, il)
         };
 
-        // 顶点缓冲（全屏四边形，TriangleStrip）
         let vb = {
             let vertices = [
                 SimpleVertex {
@@ -378,7 +369,6 @@ unsafe fn init_duplications(g: &mut Globals) -> windows::core::Result<()> {
     unsafe {
         g.outputs.clear();
 
-        // 取 IDXGIAdapter
         let mut dxgi_device: Option<IDXGIDevice> = None;
         let _ = g
             .device
@@ -494,7 +484,6 @@ unsafe fn capture_desktop_per_output(g: &mut Globals) {
                 && src_desc.Width == od.width
                 && src_desc.Height == od.height
             {
-                // GPU->GPU 拷贝
                 let box_ = D3D11_BOX {
                     left: 0,
                     top: 0,
@@ -510,7 +499,6 @@ unsafe fn capture_desktop_per_output(g: &mut Globals) {
                 && src_desc.Width == od.width
                 && src_desc.Height == od.height
             {
-                // CPU staging 路径
                 let mut staging_desc = src_desc.clone();
                 staging_desc.Usage = D3D11_USAGE_STAGING;
                 staging_desc.BindFlags = 0;
@@ -552,7 +540,6 @@ unsafe fn capture_desktop_per_output(g: &mut Globals) {
                                     *drow.add(4 * x as usize + 3) = a;
                                 }
                             } else {
-                                // 已是 BGRA
                                 std::ptr::copy_nonoverlapping(srow, drow, row_bytes);
                             }
                         }
@@ -569,7 +556,6 @@ unsafe fn capture_desktop_per_output(g: &mut Globals) {
                     }
                 }
             } else {
-                // 其他格式/尺寸不支持，跳过
             }
 
             let _ = od.dup.ReleaseFrame();
@@ -610,7 +596,6 @@ unsafe fn render(g: &mut Globals, frag: &FragmentShader) {
         let virt_w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
         let virt_h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
-        // 逐输出设置 viewport + 绑定 SRV + Draw
         for od in &g.outputs {
             let vp = D3D11_VIEWPORT {
                 TopLeftX: (od.desktop_rect.left - virt_left) as f32,
@@ -627,11 +612,9 @@ unsafe fn render(g: &mut Globals, frag: &FragmentShader) {
 
             g.ctx.Draw(4, 0);
 
-            // 解绑，防止后续绑定冲突
             g.ctx.PSSetShaderResources(0, Some(&[None]));
         }
 
-        // 还原全屏视口（并不严格必要）
         let full = D3D11_VIEWPORT {
             TopLeftX: 0.0,
             TopLeftY: 0.0,
