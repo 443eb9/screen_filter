@@ -123,8 +123,10 @@ pub fn render_loop(fragment: &'static str) -> windows::core::Result<()> {
             if current_visible != enabled {
                 current_visible = enabled;
                 if enabled {
+                    log::info!("Showing filter window");
                     let _ = ShowWindow(hWnd, SW_SHOW);
                 } else {
+                    log::info!("Hiding filter window");
                     let _ = ShowWindow(hWnd, SW_HIDE);
                 }
             }
