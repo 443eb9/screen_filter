@@ -23,6 +23,7 @@ impl FilterMode {
 pub struct Config {
     pub hotkey: String,
     pub mode: FilterMode,
+    pub launch_on_startup: bool,
 }
 
 impl Config {

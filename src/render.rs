@@ -1,12 +1,9 @@
 #![allow(non_snake_case)]
-#![windows_subsystem = "windows"]
 
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
+use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
-use std::{slice, thread};
 
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::Fxc::*;
@@ -19,7 +16,7 @@ use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
-pub static ENABLED: AtomicBool = AtomicBool::new(true);
+pub static ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[repr(C)]
 struct SimpleVertex {
@@ -73,18 +70,6 @@ void main(in float2 pos : POSITION, in float2 tex : TEXCOORD,
 }
 "#;
 
-pub struct RenderLoopController {
-    pub switch_fragment: Sender<&'static str>,
-    pub set_enabled: Sender<bool>,
-    pub toggle_enabled: Sender<()>,
-}
-
-pub struct RenderLoopControlHandler {
-    pub switch_fragment: Receiver<&'static str>,
-    pub set_enabled: Receiver<bool>,
-    pub toggle_enabled: Receiver<()>,
-}
-
 pub fn render_loop(fragment: &'static str) -> windows::core::Result<()> {
     unsafe {
         // 注册窗口类
@@ -132,20 +117,9 @@ pub fn render_loop(fragment: &'static str) -> windows::core::Result<()> {
         let _ = ShowWindow(hWnd, SW_SHOW);
         let _ = UpdateWindow(hWnd);
 
-        let mut msg = MSG::default();
-
         let mut current_visible = IsWindowVisible(hWnd).as_bool();
 
         loop {
-            while PeekMessageA(&mut msg, zeroed(), 0, 0, PM_REMOVE).as_bool() {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageA(&msg);
-                if msg.message == WM_QUIT {
-                    ENABLED.store(false, Ordering::Relaxed);
-                    break;
-                }
-            }
-
             let enabled = ENABLED.load(Ordering::Relaxed);
 
             if current_visible != enabled {
@@ -159,6 +133,8 @@ pub fn render_loop(fragment: &'static str) -> windows::core::Result<()> {
 
             if enabled {
                 render(&mut g, &frag);
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
     }

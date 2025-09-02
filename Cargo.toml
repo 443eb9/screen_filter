@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+auto-launch = "0.5"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.9"
 win-hotkey = "0.3"
