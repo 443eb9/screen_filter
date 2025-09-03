@@ -1,6 +1,10 @@
 # Author: https://443eb9.dev
 # Github: https://github.com/443eb9/screen_filter
 
-hotkey = "ctrl+alt+c"
+# Modify this config file, the program will detect the change and
+# restart automatically.
+
+toggle = "ctrl+alt+c"
+freeze = "ctrl+alt+f"
 mode = "OklabGrayscale"  # Options: OklabGrayscale, LabGrayscale
 launch_on_startup = true

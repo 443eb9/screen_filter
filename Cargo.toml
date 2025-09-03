@@ -5,8 +5,12 @@ edition = "2024"
 
 [dependencies]
 auto-launch = "0.5"
+crossbeam-channel = "0.5"
 log = "0.4"
 env_logger = "0.11"
+notify = "8"
+notify-debouncer-mini = "0.7"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.9"
 win-hotkey = "0.3"
@@ -26,5 +30,4 @@ windows = { version = "0.61", features = [
     "Win32_System_LibraryLoader",
 ] }
 winreg = "0.55"
-reqwest = { version = "0.12", features = ["blocking", "json"] }
-winrt-notification = "0.5.1"
+winrt-notification = "0.5"

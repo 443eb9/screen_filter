@@ -1,15 +1,24 @@
 #![windows_subsystem = "windows"]
 
-use std::{fs::File, io::Write, path::Path, sync::atomic::Ordering};
+use std::{
+    fs::File,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::atomic::Ordering,
+};
 
 use auto_launch::AutoLaunch;
+use crossbeam_channel::Sender;
 use env_logger::{Builder, Target};
 use log::LevelFilter;
 use win_hotkey::{HotkeyManager, HotkeyManagerImpl};
 use winreg::{RegKey, enums::HKEY_CURRENT_USER};
 use winrt_notification::Toast;
 
-use crate::{config::Config, render::ENABLED};
+use crate::{
+    config::Config,
+    render::{ENABLED, FROZEN},
+};
 
 mod config;
 mod render;
@@ -41,23 +50,22 @@ fn configure_auto_launch(config: &Config, path: &Path) {
 }
 
 fn configure_hotkey(config: &Config) -> Result<HotkeyManager<()>, Box<dyn std::error::Error>> {
-    let (vk, mods) = config.parse_hotkey().unwrap();
     let mut mgr = HotkeyManager::new();
-    match mgr.register(
-        vk,
-        Some(&mods),
-        Some(move || {
+    mgr.unregister_all()?;
+    mgr.register(
+        config.toggle.vk,
+        Some(&config.toggle.mods),
+        Some(|| {
             ENABLED.fetch_xor(true, Ordering::Relaxed);
         }),
-    ) {
-        Ok(_) => {
-            log::info!("Hotkey registered, entering event loop");
-        }
-        Err(err) => {
-            log::error!("Failed to register hotkey: {}", err);
-            return Err(Box::new(err));
-        }
-    };
+    )?;
+    mgr.register(
+        config.freeze.vk,
+        Some(&config.freeze.mods),
+        Some(|| {
+            FROZEN.fetch_xor(true, Ordering::Relaxed);
+        }),
+    )?;
 
     Ok(mgr)
 }
@@ -119,39 +127,71 @@ fn main() {
         }
     }
 
-    let config = config::get_config();
+    let config_receiver = config::get_config();
+    let mut last_terminator: Option<Sender<()>> = None;
 
+    while let Ok(config) = config_receiver.recv() {
+        if let Some(last_terminator) = &last_terminator {
+            log::info!("Terminating last event loop.");
+            let _ = last_terminator.send(());
+            Toast::new(APP_ID)
+                .title("Screen Filter restarted.")
+                .show()
+                .unwrap();
+        } else {
+            // First run
+            Toast::new(APP_ID)
+                .title("Screen Filter Running")
+                .show()
+                .unwrap();
+        }
+
+        let config = config;
+        let path = path.clone();
+        log::info!("Stating event loop.");
+        if let Some(terminator) = start_event_loop(config, path) {
+            last_terminator = Some(terminator.tx);
+        }
+    }
+}
+
+struct EventLoopTerminator {
+    tx: Sender<()>,
+}
+
+fn start_event_loop(config: Config, path: PathBuf) -> Option<EventLoopTerminator> {
     configure_auto_launch(&config, &path);
 
     let fragment = config.mode.fragment_shader();
 
-    std::thread::spawn(|| {
+    let (terminator_tx, terminator_rx) = crossbeam_channel::unbounded();
+
+    let trx = terminator_rx.clone();
+    std::thread::spawn(move || {
         log::info!("Starting render loop");
-        match render::render_loop(fragment) {
-            Ok(_) => {}
-            Err(err) => {
-                log::error!("Render loop error: {}", err);
-                Toast::new(APP_ID)
-                    .title("Screen Filter Error")
-                    .text1(&format!("Render loop error: {}", err))
-                    .show()
-                    .unwrap();
-            }
-        };
+        if let Err(err) = render::render_loop(fragment, trx.clone()) {
+            log::error!("Render loop error: {}", err);
+        }
     });
 
-    let mgr = configure_hotkey(&config);
-    match mgr {
-        Ok(mgr) => {
-            mgr.event_loop();
-        }
+    let mgr = match configure_hotkey(&config) {
+        Ok(ok) => ok,
         Err(err) => {
             log::error!("Hotkey manager error: {}", err);
-            Toast::new(APP_ID)
-                .title("Screen Filter Error")
-                .text1(&format!("Hotkey manager error: {}", err))
-                .show()
-                .unwrap();
+            return None;
         }
-    }
+    };
+
+    let interrupt_handle = mgr.interrupt_handle();
+    std::thread::spawn(move || {
+        if let Ok(_) = terminator_rx.recv() {
+            interrupt_handle.interrupt();
+        }
+    });
+
+    std::thread::spawn(move || {
+        mgr.event_loop();
+    });
+
+    Some(EventLoopTerminator { tx: terminator_tx })
 }

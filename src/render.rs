@@ -5,13 +5,13 @@ use std::mem::{size_of, zeroed};
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crossbeam_channel::Receiver;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::Fxc::*;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
-use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
@@ -19,6 +19,7 @@ use windows::core::*;
 use crate::APP_ID;
 
 pub static ENABLED: AtomicBool = AtomicBool::new(false);
+pub static FROZEN: AtomicBool = AtomicBool::new(false);
 
 #[repr(C)]
 struct SimpleVertex {
@@ -72,7 +73,7 @@ void main(in float2 pos : POSITION, in float2 tex : TEXCOORD,
 }
 "#;
 
-pub fn render_loop(fragment: &'static str) -> windows::core::Result<()> {
+pub fn render_loop(fragment: &'static str, terminator: Receiver<()>) -> windows::core::Result<()> {
     unsafe {
         let hinstance = GetModuleHandleA(None)?;
         let class_name = s!("DX11ScreenFilter");
@@ -107,37 +108,79 @@ pub fn render_loop(fragment: &'static str) -> windows::core::Result<()> {
             None,
         )?;
 
-        let _ = SetWindowDisplayAffinity(hWnd, WDA_EXCLUDEFROMCAPTURE);
         SetLayeredWindowAttributes(hWnd, COLORREF(0), 255, LWA_ALPHA)?;
 
         let mut g = init_d3d11(hWnd)?;
         init_duplications(&mut g)?;
         let frag = compile_shader(&g, fragment)?;
 
-        let _ = ShowWindow(hWnd, SW_SHOW);
-        let _ = UpdateWindow(hWnd);
+        init_atomics(hWnd);
 
-        let mut current_visible = IsWindowVisible(hWnd).as_bool();
+        let mut current_visible = ENABLED.load(Ordering::Relaxed);
+        let mut current_frozen = FROZEN.load(Ordering::Relaxed);
 
         loop {
+            if terminator.try_recv().is_ok() {
+                let _ = DestroyWindow(hWnd);
+                break Ok(());
+            }
+
             let enabled = ENABLED.load(Ordering::Relaxed);
+            let frozen = FROZEN.load(Ordering::Relaxed);
 
             if current_visible != enabled {
                 current_visible = enabled;
-                if enabled {
-                    log::info!("Showing filter window");
-                    let _ = ShowWindow(hWnd, SW_SHOW);
-                } else {
-                    log::info!("Hiding filter window");
-                    let _ = ShowWindow(hWnd, SW_HIDE);
+                update_enabled(hWnd);
+
+                if frozen {
+                    render(&mut g, &frag);
                 }
             }
 
-            if enabled {
+            if current_frozen != frozen {
+                current_frozen = frozen;
+                update_frozen(hWnd);
+            }
+
+            if enabled && !frozen {
                 render(&mut g, &frag);
             } else {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
+        }
+    }
+}
+
+unsafe fn init_atomics(hWnd: HWND) {
+    unsafe {
+        let _ = ShowWindow(hWnd, SW_HIDE);
+        ENABLED.store(false, Ordering::Relaxed);
+
+        let _ = SetWindowDisplayAffinity(hWnd, WDA_EXCLUDEFROMCAPTURE);
+        FROZEN.store(false, Ordering::Relaxed);
+    }
+}
+
+unsafe fn update_enabled(hWnd: HWND) {
+    unsafe {
+        if ENABLED.load(Ordering::Relaxed) {
+            log::info!("Showing filter window");
+            let _ = ShowWindow(hWnd, SW_SHOW);
+        } else {
+            log::info!("Hiding filter window");
+            let _ = ShowWindow(hWnd, SW_HIDE);
+        }
+    }
+}
+
+unsafe fn update_frozen(hWnd: HWND) {
+    unsafe {
+        if FROZEN.load(Ordering::Relaxed) {
+            log::info!("Freezing filter");
+            let _ = SetWindowDisplayAffinity(hWnd, WDA_NONE);
+        } else {
+            log::info!("Unfreezing filter");
+            let _ = SetWindowDisplayAffinity(hWnd, WDA_EXCLUDEFROMCAPTURE);
         }
     }
 }
@@ -147,26 +190,28 @@ unsafe fn init_d3d11(hWnd: HWND) -> windows::core::Result<Globals> {
         let virt_w = GetSystemMetrics(SM_CXVIRTUALSCREEN) as u32;
         let virt_h = GetSystemMetrics(SM_CYVIRTUALSCREEN) as u32;
 
-        let mut sd: DXGI_SWAP_CHAIN_DESC = zeroed();
-        sd.BufferCount = 1;
-        sd.BufferDesc = DXGI_MODE_DESC {
-            Width: virt_w,
-            Height: virt_h,
-            RefreshRate: DXGI_RATIONAL {
-                Numerator: 60,
-                Denominator: 1,
+        let sd = DXGI_SWAP_CHAIN_DESC {
+            BufferCount: 1,
+            BufferDesc: DXGI_MODE_DESC {
+                Width: virt_w,
+                Height: virt_h,
+                RefreshRate: DXGI_RATIONAL {
+                    Numerator: 60,
+                    Denominator: 1,
+                },
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                ..Default::default()
             },
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            OutputWindow: hWnd,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Windowed: BOOL(1),
+            SwapEffect: DXGI_SWAP_EFFECT_DISCARD,
             ..Default::default()
         };
-        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        sd.OutputWindow = hWnd;
-        sd.SampleDesc = DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        };
-        sd.Windowed = BOOL(1);
-        sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
 
         let mut device: Option<ID3D11Device> = None;
         let mut ctx: Option<ID3D11DeviceContext> = None;
