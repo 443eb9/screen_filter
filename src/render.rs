@@ -16,6 +16,8 @@ use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
+use crate::APP_ID;
+
 pub static ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[repr(C)]
@@ -93,7 +95,7 @@ pub fn render_loop(fragment: &'static str) -> windows::core::Result<()> {
         let hWnd = CreateWindowExA(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             class_name,
-            s!("Screen Filter"),
+            PCSTR::from_raw(APP_ID.as_ptr()),
             WS_POPUP,
             virt_left,
             virt_top,
