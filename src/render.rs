@@ -4,8 +4,9 @@ use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, TryRecvError};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::Fxc::*;
 use windows::Win32::Graphics::Direct3D::*;
@@ -73,7 +74,11 @@ void main(in float2 pos : POSITION, in float2 tex : TEXCOORD,
 }
 "#;
 
-pub fn render_loop(fragment: &'static str, terminator: Receiver<()>) -> windows::core::Result<()> {
+pub fn render_loop(
+    fragment: &'static str,
+    refresh_rate: u32,
+    terminator: Receiver<()>,
+) -> windows::core::Result<()> {
     unsafe {
         let hinstance = GetModuleHandleA(None)?;
         let class_name = s!("DX11ScreenFilter");
@@ -119,8 +124,13 @@ pub fn render_loop(fragment: &'static str, terminator: Receiver<()>) -> windows:
         let mut current_visible = ENABLED.load(Ordering::Relaxed);
         let mut current_frozen = FROZEN.load(Ordering::Relaxed);
 
+        let mut last_render = Instant::now();
+        let frame_time = 1.0 / refresh_rate as f32;
+
         loop {
-            if terminator.try_recv().is_ok() {
+            let terminator = terminator.try_recv();
+            if terminator.is_ok() || terminator.is_err_and(|e| e == TryRecvError::Disconnected) {
+                log::info!("Terminating render loop.");
                 let _ = DestroyWindow(hWnd);
                 break Ok(());
             }
@@ -143,7 +153,10 @@ pub fn render_loop(fragment: &'static str, terminator: Receiver<()>) -> windows:
             }
 
             if enabled && !frozen {
-                render(&mut g, &frag);
+                if last_render.elapsed().as_secs_f32() > frame_time {
+                    render(&mut g, &frag);
+                    last_render = Instant::now();
+                }
             } else {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }

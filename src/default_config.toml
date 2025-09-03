@@ -8,3 +8,4 @@ toggle = "ctrl+alt+c"
 freeze = "ctrl+alt+f"
 mode = "OklabGrayscale"  # Options: OklabGrayscale, LabGrayscale
 launch_on_startup = true
+refresh_rate = 0 # Option: <Any Positive Integer>, 0 if don't limit

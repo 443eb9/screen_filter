@@ -5,7 +5,7 @@ use notify_debouncer_mini::new_debouncer;
 use serde::Deserialize;
 use win_hotkey::keys::{ModifiersKey, VirtualKey};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug, Clone, Copy)]
 pub enum FilterMode {
     OklabGrayscale,
     LabGrayscale,
@@ -61,6 +61,7 @@ pub struct Config {
     pub freeze: KeySequence,
     pub mode: FilterMode,
     pub launch_on_startup: bool,
+    pub refresh_rate: u32,
 }
 
 const CONFIG_FILE: &str = "config.toml";

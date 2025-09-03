@@ -1,11 +1,6 @@
 #![windows_subsystem = "windows"]
 
-use std::{
-    fs::File,
-    io::Write,
-    path::{Path, PathBuf},
-    sync::atomic::Ordering,
-};
+use std::{fs::File, io::Write, path::Path, sync::atomic::Ordering};
 
 use auto_launch::AutoLaunch;
 use crossbeam_channel::Sender;
@@ -141,15 +136,16 @@ fn main() {
         } else {
             // First run
             Toast::new(APP_ID)
-                .title("Screen Filter Running")
+                .title("Screen Filter started.")
                 .show()
                 .unwrap();
         }
 
         let config = config;
-        let path = path.clone();
+        configure_auto_launch(&config, &path);
+
         log::info!("Stating event loop.");
-        if let Some(terminator) = start_event_loop(config, path) {
+        if let Some(terminator) = start_event_loop(config) {
             last_terminator = Some(terminator.tx);
         }
     }
@@ -159,17 +155,27 @@ struct EventLoopTerminator {
     tx: Sender<()>,
 }
 
-fn start_event_loop(config: Config, path: PathBuf) -> Option<EventLoopTerminator> {
-    configure_auto_launch(&config, &path);
-
+fn start_event_loop(config: Config) -> Option<EventLoopTerminator> {
     let fragment = config.mode.fragment_shader();
 
     let (terminator_tx, terminator_rx) = crossbeam_channel::unbounded();
 
     let trx = terminator_rx.clone();
     std::thread::spawn(move || {
-        log::info!("Starting render loop");
-        if let Err(err) = render::render_loop(fragment, trx.clone()) {
+        log::info!(
+            "Starting render loop: {:?} at {} fps",
+            config.mode,
+            config.refresh_rate
+        );
+        if let Err(err) = render::render_loop(
+            fragment,
+            if config.refresh_rate == 0 {
+                u32::MAX
+            } else {
+                config.refresh_rate
+            },
+            trx.clone(),
+        ) {
             log::error!("Render loop error: {}", err);
         }
     });
@@ -185,11 +191,13 @@ fn start_event_loop(config: Config, path: PathBuf) -> Option<EventLoopTerminator
     let interrupt_handle = mgr.interrupt_handle();
     std::thread::spawn(move || {
         if let Ok(_) = terminator_rx.recv() {
+            log::info!("Interrupting hotkey manager.");
             interrupt_handle.interrupt();
         }
     });
 
     std::thread::spawn(move || {
+        log::info!("Starting hotkey manager event loop.");
         mgr.event_loop();
     });
 
