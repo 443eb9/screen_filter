@@ -431,19 +431,13 @@ unsafe fn init_duplications(g: &mut Globals) -> windows::core::Result<()> {
     unsafe {
         g.outputs.clear();
 
-        let mut dxgi_device: Option<IDXGIDevice> = None;
-        let _ = g
-            .device
-            .query(&IDXGIDevice::IID, std::mem::transmute(&mut dxgi_device));
-        let dxgi_device = dxgi_device.unwrap();
+        let dxgi_device = g.device.cast::<IDXGIDevice>()?;
 
         let adapter = dxgi_device.GetParent::<IDXGIAdapter>()?;
 
         let mut i = 0;
         while let Ok(output) = adapter.EnumOutputs(i) {
-            let mut output1: Option<IDXGIOutput1> = None;
-            let _ = output.query(&IDXGIOutput1::IID, std::mem::transmute(&mut output1));
-            let output1 = output1.unwrap();
+            let output1 = output.cast::<IDXGIOutput1>()?;
 
             let outdesc = output.GetDesc()?;
 
@@ -520,7 +514,7 @@ unsafe fn capture_desktop_per_output(g: &mut Globals) {
             {
                 Ok(_) => {}
                 Err(err) => {
-                    let code = err.code().0 as i32;
+                    let code = err.code().0;
                     if code == DXGI_ERROR_WAIT_TIMEOUT.0 {
                         continue;
                     } else if code == DXGI_ERROR_ACCESS_LOST.0 {
@@ -533,9 +527,14 @@ unsafe fn capture_desktop_per_output(g: &mut Globals) {
             };
             let desktop_res = desktop_res.unwrap();
 
-            let mut src_tex: Option<ID3D11Texture2D> = None;
-            let _ = desktop_res.query(&ID3D11Texture2D::IID, std::mem::transmute(&mut src_tex));
-            let src_tex = src_tex.unwrap();
+            let src_tex = match desktop_res.cast::<ID3D11Texture2D>() {
+                Ok(texture) => texture,
+                Err(error) => {
+                    log::error!("Capture texture conversion failed: {error}");
+                    let _ = od.dup.ReleaseFrame();
+                    continue;
+                }
+            };
 
             let mut src_desc: D3D11_TEXTURE2D_DESC = Default::default();
             src_tex.GetDesc(&mut src_desc);
@@ -561,7 +560,7 @@ unsafe fn capture_desktop_per_output(g: &mut Globals) {
                 && src_desc.Width == od.width
                 && src_desc.Height == od.height
             {
-                let mut staging_desc = src_desc.clone();
+                let mut staging_desc = src_desc;
                 staging_desc.Usage = D3D11_USAGE_STAGING;
                 staging_desc.BindFlags = 0;
                 staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
@@ -592,11 +591,11 @@ unsafe fn capture_desktop_per_output(g: &mut Globals) {
                             let drow = full.as_mut_ptr().add(y as usize * row_bytes);
                             if src_is_rgba {
                                 for x in 0..od.width {
-                                    let r = *srow.add(4 * x as usize + 0);
+                                    let r = *srow.add(4 * x as usize);
                                     let g = *srow.add(4 * x as usize + 1);
                                     let b = *srow.add(4 * x as usize + 2);
                                     let a = *srow.add(4 * x as usize + 3);
-                                    *drow.add(4 * x as usize + 0) = b;
+                                    *drow.add(4 * x as usize) = b;
                                     *drow.add(4 * x as usize + 1) = g;
                                     *drow.add(4 * x as usize + 2) = r;
                                     *drow.add(4 * x as usize + 3) = a;
@@ -617,7 +616,6 @@ unsafe fn capture_desktop_per_output(g: &mut Globals) {
                         );
                     }
                 }
-            } else {
             }
 
             let _ = od.dup.ReleaseFrame();

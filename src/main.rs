@@ -1,12 +1,12 @@
 #![windows_subsystem = "windows"]
 
-use std::{fs::File, io::Write, path::Path, sync::atomic::Ordering};
+use std::{fs::File, io::Write, path::Path, sync::atomic::Ordering, thread::JoinHandle};
 
 use auto_launch::AutoLaunch;
 use crossbeam_channel::Sender;
 use env_logger::{Builder, Target};
 use log::LevelFilter;
-use win_hotkey::{HotkeyManager, HotkeyManagerImpl};
+use win_hotkey::{HotkeyManager, HotkeyManagerImpl, InterruptHandle};
 use winreg::{RegKey, enums::HKEY_CURRENT_USER};
 use winrt_notification::Toast;
 
@@ -22,184 +22,175 @@ mod update;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const APP_ID: &str = "ScreenFilter";
 
-fn panic_handler(info: &std::panic::PanicHookInfo) {
-    let Ok(path) = std::env::current_exe() else {
-        return;
-    };
-    let log_path = path.with_file_name("panic.txt");
-    let Ok(mut file) = File::options().append(true).create(true).open(log_path) else {
-        return;
-    };
-    let _ = writeln!(file, "Panic occurred: {}", info);
-}
+type AppResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-fn configure_auto_launch(config: &Config, path: &Path) {
-    let auto = AutoLaunch::new(APP_ID, path.to_str().unwrap(), &[] as &[&str]);
-    if config.launch_on_startup {
-        log::info!("Enabling launch on startup");
-        auto.enable().unwrap();
-    } else {
-        log::info!("Disabling launch on startup");
-        auto.disable().unwrap();
+fn panic_handler(info: &std::panic::PanicHookInfo) {
+    if let Ok(path) = std::env::current_exe()
+        && let Ok(mut file) = File::options()
+            .append(true)
+            .create(true)
+            .open(path.with_file_name("panic.txt"))
+    {
+        let _ = writeln!(file, "{info}");
     }
 }
 
-fn configure_hotkey(config: &Config) -> Result<HotkeyManager<()>, Box<dyn std::error::Error>> {
-    let mut mgr = HotkeyManager::new();
-    mgr.unregister_all()?;
-    mgr.register(
+fn notify(title: &str, message: &str) {
+    if let Err(error) = Toast::new(APP_ID).title(title).text1(message).show() {
+        log::warn!("Notification failed: {error}");
+    }
+}
+
+fn configure_auto_launch(config: &Config, path: &Path) -> AppResult<()> {
+    let auto = AutoLaunch::new(
+        APP_ID,
+        path.to_str().ok_or("Executable path requires Unicode")?,
+        &[] as &[&str],
+    );
+    if config.launch_on_startup {
+        auto.enable()?;
+    } else {
+        auto.disable()?;
+    }
+    Ok(())
+}
+
+fn configure_hotkeys(config: &Config) -> AppResult<HotkeyManager<()>> {
+    let mut manager = HotkeyManager::new();
+    manager.register(
         config.toggle.vk,
         Some(&config.toggle.mods),
         Some(|| {
             ENABLED.fetch_xor(true, Ordering::Relaxed);
         }),
     )?;
-    mgr.register(
+    manager.register(
         config.freeze.vk,
         Some(&config.freeze.mods),
         Some(|| {
             FROZEN.fetch_xor(true, Ordering::Relaxed);
         }),
     )?;
-
-    Ok(mgr)
+    Ok(manager)
 }
 
-fn register_app_id() {
+fn register_app_id() -> AppResult<()> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let (classes, _) = hkcu
-        .create_subkey("SOFTWARE\\Classes\\AppUserModelId")
-        .unwrap();
-    let (appkey, _) = classes.create_subkey(APP_ID).unwrap();
-
-    appkey.set_value("DisplayName", &"Screen Filter").unwrap();
+    let (appkey, _) = hkcu.create_subkey(format!("SOFTWARE\\Classes\\AppUserModelId\\{APP_ID}"))?;
+    appkey.set_value("DisplayName", &"Screen Filter")?;
+    Ok(())
 }
 
 fn main() {
     std::panic::set_hook(Box::new(panic_handler));
+    if let Err(error) = run() {
+        log::error!("Application error: {error}");
+        notify("Screen Filter stopped", &error.to_string());
+    }
+}
 
-    register_app_id();
-
-    let path = std::env::current_exe().unwrap();
-    let log_target = Box::new(
-        File::options()
-            .append(true)
-            .create(true)
-            .open(path.with_file_name("log.txt"))
-            .unwrap(),
-    );
+fn run() -> AppResult<()> {
+    let path = std::env::current_exe()?;
+    let log_target = File::options()
+        .append(true)
+        .create(true)
+        .open(path.with_file_name("log.txt"))?;
     Builder::new()
-        .target(Target::Pipe(log_target))
+        .target(Target::Pipe(Box::new(log_target)))
         .filter(None, LevelFilter::Info)
-        .init();
+        .try_init()?;
+    register_app_id()?;
 
-    match update::check_for_updates() {
+    std::thread::spawn(|| match update::check_for_updates() {
         Ok(Some(release)) => {
             log::info!(
-                "Update available: {}, download at {}",
+                "Update available: {} at {}",
                 release.tag_name,
                 release.html_url
             );
-            Toast::new(APP_ID)
-                .title("Screen Filter Update Available")
-                .text1(&format!(
-                    "A new version of Screen Filter is available: {}, goto {} to download.",
-                    release.tag_name, release.html_url
-                ))
-                .show()
-                .unwrap();
+            notify(
+                "Screen Filter update available",
+                &format!("{}: {}", release.tag_name, release.html_url),
+            );
         }
-        Ok(None) => {
-            log::info!("No updates available");
-        }
-        Err(err) => {
-            log::error!("Failed to check for updates: {}", err);
-            Toast::new(APP_ID)
-                .title("Screen Filter Update Check Failed")
-                .text1(&format!("Failed to check for updates: {}", err))
-                .show()
-                .unwrap();
-        }
-    }
+        Ok(None) => log::info!("Running the current release"),
+        Err(error) => log::warn!("Update check failed: {error}"),
+    });
 
-    let config_receiver = config::get_config();
-    let mut last_terminator: Option<Sender<()>> = None;
+    let config_receiver = config::watch_config(&path)?;
+    let mut active = None::<EventLoop>;
+    let mut last_config = None;
 
     while let Ok(config) = config_receiver.recv() {
-        if let Some(last_terminator) = &last_terminator {
-            log::info!("Terminating last event loop.");
-            let _ = last_terminator.send(());
-            Toast::new(APP_ID)
-                .title("Screen Filter restarted.")
-                .show()
-                .unwrap();
-        } else {
-            // First run
-            Toast::new(APP_ID)
-                .title("Screen Filter started.")
-                .show()
-                .unwrap();
+        if last_config.as_ref() == Some(&config) {
+            continue;
         }
-
-        let config = config;
-        configure_auto_launch(&config, &path);
-
-        log::info!("Stating event loop.");
-        if let Some(terminator) = start_event_loop(config) {
-            last_terminator = Some(terminator.tx);
+        // Joining the old workers releases their hotkeys and capture resources before restart.
+        drop(active.take());
+        if let Err(error) = configure_auto_launch(&config, &path) {
+            log::warn!("Startup registration failed: {error}");
         }
+        match EventLoop::start(&config) {
+            Ok(event_loop) => {
+                active = Some(event_loop);
+                last_config = Some(config);
+                notify("Screen Filter ready", "Hotkeys are active.");
+            }
+            Err(error) => {
+                log::error!("Event loop startup failed: {error}");
+                notify("Screen Filter paused", &error.to_string());
+                last_config = None;
+            }
+        }
+    }
+    Ok(())
+}
+
+struct EventLoop {
+    stop: Sender<()>,
+    interrupt: InterruptHandle,
+    render_thread: Option<JoinHandle<()>>,
+    hotkey_thread: Option<JoinHandle<()>>,
+}
+
+impl EventLoop {
+    fn start(config: &Config) -> AppResult<Self> {
+        let manager = configure_hotkeys(config)?;
+        let interrupt = manager.interrupt_handle();
+        let (stop, receiver) = crossbeam_channel::bounded(1);
+        let fragment = config.mode.fragment_shader();
+        let refresh_rate = config.refresh_rate;
+        let render_thread = std::thread::spawn(move || {
+            let refresh_rate = if refresh_rate == 0 {
+                u32::MAX
+            } else {
+                refresh_rate
+            };
+            if let Err(error) = render::render_loop(fragment, refresh_rate, receiver) {
+                log::error!("Render loop failed: {error}");
+                notify("Screen Filter paused", &error.to_string());
+            }
+        });
+        let hotkey_thread = std::thread::spawn(move || manager.event_loop());
+        Ok(Self {
+            stop,
+            interrupt,
+            render_thread: Some(render_thread),
+            hotkey_thread: Some(hotkey_thread),
+        })
     }
 }
 
-struct EventLoopTerminator {
-    tx: Sender<()>,
-}
-
-fn start_event_loop(config: Config) -> Option<EventLoopTerminator> {
-    let fragment = config.mode.fragment_shader();
-
-    let (terminator_tx, terminator_rx) = crossbeam_channel::unbounded();
-
-    let trx = terminator_rx.clone();
-    std::thread::spawn(move || {
-        log::info!(
-            "Starting render loop: {:?} at {} fps",
-            config.mode,
-            config.refresh_rate
-        );
-        if let Err(err) = render::render_loop(
-            fragment,
-            if config.refresh_rate == 0 {
-                u32::MAX
-            } else {
-                config.refresh_rate
-            },
-            trx.clone(),
-        ) {
-            log::error!("Render loop error: {}", err);
+impl Drop for EventLoop {
+    fn drop(&mut self) {
+        let _ = self.stop.try_send(());
+        self.interrupt.interrupt();
+        for handle in [&mut self.render_thread, &mut self.hotkey_thread] {
+            if let Some(handle) = handle.take()
+                && handle.join().is_err()
+            {
+                log::error!("Worker thread panicked during shutdown");
+            }
         }
-    });
-
-    let mgr = match configure_hotkey(&config) {
-        Ok(ok) => ok,
-        Err(err) => {
-            log::error!("Hotkey manager error: {}", err);
-            return None;
-        }
-    };
-
-    let interrupt_handle = mgr.interrupt_handle();
-    std::thread::spawn(move || {
-        if let Ok(_) = terminator_rx.recv() {
-            log::info!("Interrupting hotkey manager.");
-            interrupt_handle.interrupt();
-        }
-    });
-
-    std::thread::spawn(move || {
-        log::info!("Starting hotkey manager event loop.");
-        mgr.event_loop();
-    });
-
-    Some(EventLoopTerminator { tx: terminator_tx })
+    }
 }
