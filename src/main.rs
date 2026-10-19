@@ -9,7 +9,7 @@ use std::{
 };
 
 use auto_launch::AutoLaunch;
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender, select};
 use env_logger::{Builder, Target};
 use log::LevelFilter;
 use win_hotkey::{HotkeyManager, HotkeyManagerImpl, InterruptHandle};
@@ -21,6 +21,8 @@ use crate::{config::Config, render::FilterControl};
 mod color;
 mod config;
 mod gpu;
+#[cfg(test)]
+mod gpu_tests;
 mod render;
 mod update;
 mod window;
@@ -124,12 +126,40 @@ fn run() -> AppResult<()> {
         Err(error) => log::warn!("Update check failed: {error}"),
     });
 
-    let config_receiver = config::watch_config(&path)?;
+    let config_watcher = config::ConfigWatcher::start(&path)?;
     let mut active = None::<EventLoop>;
     let mut last_config = None;
     let control = Arc::new(FilterControl::default());
 
-    while let Ok(config) = config_receiver.recv() {
+    let idle = crossbeam_channel::never();
+    loop {
+        let finished = active
+            .as_ref()
+            .map(|event_loop| &event_loop.finished)
+            .unwrap_or(&idle);
+        let update = select! {
+            recv(finished) -> result => {
+                drop(active.take());
+                let error = match result {
+                    Ok(Ok(())) => break,
+                    Ok(Err(error)) => error,
+                    Err(_) => "Render worker ended unexpectedly".into(),
+                };
+                log::error!("Render loop stopped: {error}");
+                notify("Screen Filter paused", &error);
+                last_config = None;
+                continue;
+            },
+            recv(config_watcher.updates) -> update => match update { Ok(update) => update, Err(_) => break },
+        };
+        let config = match update {
+            Ok(config) => config,
+            Err(error) => {
+                log::error!("Configuration error, retaining active settings: {error}");
+                notify("Screen Filter configuration error", &error);
+                continue;
+            }
+        };
         if last_config.as_ref() == Some(&config) {
             continue;
         }
@@ -156,6 +186,7 @@ fn run() -> AppResult<()> {
 
 struct EventLoop {
     stop: Sender<()>,
+    finished: Receiver<Result<(), String>>,
     interrupt: InterruptHandle,
     render_thread: Option<JoinHandle<()>>,
     hotkey_thread: Option<JoinHandle<()>>,
@@ -166,17 +197,18 @@ impl EventLoop {
         let manager = configure_hotkeys(config, Arc::clone(&control))?;
         let interrupt = manager.interrupt_handle();
         let (stop, receiver) = crossbeam_channel::bounded(1);
+        let (finished_tx, finished) = crossbeam_channel::bounded(1);
         let fragment = config.mode.fragment_shader();
         let refresh_rate = config.refresh_rate;
         let render_thread = std::thread::spawn(move || {
-            if let Err(error) = render::render_loop(fragment, refresh_rate, receiver, control) {
-                log::error!("Render loop failed: {error}");
-                notify("Screen Filter paused", &error.to_string());
-            }
+            let result = render::render_loop(fragment, refresh_rate, receiver, control)
+                .map_err(|error| error.to_string());
+            let _ = finished_tx.send(result);
         });
         let hotkey_thread = std::thread::spawn(move || manager.event_loop());
         Ok(Self {
             stop,
+            finished,
             interrupt,
             render_thread: Some(render_thread),
             hotkey_thread: Some(hotkey_thread),
@@ -194,6 +226,28 @@ impl Drop for EventLoop {
             {
                 log::error!("Worker thread panicked during shutdown");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an interactive desktop and available global hotkeys"]
+    fn event_loop_restart_releases_hotkeys_and_joins_workers() {
+        let config = Config::parse(
+            &include_str!("default_config.toml")
+                .replace("ctrl+alt+c", "ctrl+alt+shift+8")
+                .replace("ctrl+alt+f", "ctrl+alt+shift+9"),
+        )
+        .unwrap();
+        let control = Arc::new(FilterControl::default());
+        for _ in 0..3 {
+            let event_loop = EventLoop::start(&config, Arc::clone(&control)).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(event_loop);
         }
     }
 }

@@ -561,6 +561,37 @@ impl AcquiredFrame {
         self.released = true;
         unsafe { self.duplication.ReleaseFrame() }
     }
+
+    #[cfg(test)]
+    fn center_rgba8(&self, gpu: &Gpu) -> [u8; 4] {
+        unsafe {
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            self.texture.GetDesc(&mut desc);
+            assert!(matches!(
+                desc.Format,
+                DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM
+            ));
+            desc.Usage = D3D11_USAGE_STAGING;
+            desc.BindFlags = 0;
+            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+            desc.MiscFlags = 0;
+            let mut staging = None;
+            gpu.device
+                .CreateTexture2D(&desc, None, Some(&mut staging))
+                .unwrap();
+            let staging = staging.unwrap();
+            gpu.context.CopyResource(&staging, &self.texture);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            gpu.context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .unwrap();
+            let offset = (desc.Height / 2) as usize * mapped.RowPitch as usize
+                + (desc.Width / 2) as usize * 4;
+            let pixel = *(mapped.pData as *const u8).add(offset).cast::<[u8; 4]>();
+            gpu.context.Unmap(&staging, 0);
+            pixel
+        }
+    }
 }
 
 impl Drop for AcquiredFrame {
@@ -577,6 +608,71 @@ impl Drop for AcquiredFrame {
 mod tests {
     use super::*;
     use crate::config::FilterMode;
+
+    #[test]
+    #[ignore = "briefly shows a gray overlay on each legacy SDR display"]
+    fn live_composition_is_visible_in_frozen_capture() {
+        let class = WindowClass::new().unwrap();
+        let factory = unsafe { CreateDXGIFactory1::<IDXGIFactory2>() }.unwrap();
+        let specs = MonitorSpec::enumerate(&factory).unwrap();
+        let mut verified = 0;
+        for spec in specs {
+            let color = ColorState::read(spec.adapter_id, &spec.desc.DeviceName).unwrap();
+            if matches!(color, ColorState::Advanced) {
+                continue;
+            }
+            let mut monitor = Monitor::new(
+                &spec,
+                color,
+                &factory,
+                &class,
+                FilterMode::OklabGrayscale.fragment_shader(),
+            )
+            .unwrap();
+            unsafe {
+                let buffer = monitor.swap_chain.GetBuffer::<ID3D11Texture2D>(0).unwrap();
+                let mut view = None;
+                monitor
+                    .gpu
+                    .device
+                    .CreateRenderTargetView(&buffer, None, Some(&mut view))
+                    .unwrap();
+                monitor
+                    .gpu
+                    .context
+                    .ClearRenderTargetView(view.as_ref().unwrap(), &[0.18, 0.18, 0.18, 1.0]);
+                monitor
+                    .swap_chain
+                    .Present(0, DXGI_PRESENT::default())
+                    .ok()
+                    .unwrap();
+            }
+            monitor.overlay.set_frozen(true).unwrap();
+            monitor.overlay.show(true);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut last = None;
+            while Instant::now() < deadline {
+                assert!(class.process_messages());
+                if let Some(frame) = AcquiredFrame::next(&monitor.duplication).unwrap() {
+                    last = Some(frame.center_rgba8(&monitor.gpu));
+                    frame.release().unwrap();
+                    if last.is_some_and(|pixel| pixel[..3] == [46, 46, 46]) {
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            monitor.overlay.set_frozen(false).unwrap();
+            monitor.overlay.show(false);
+            assert!(
+                last.is_some_and(|pixel| pixel[..3] == [46, 46, 46]),
+                "{}: {last:?}",
+                spec.name()
+            );
+            verified += 1;
+        }
+        assert!(verified > 0, "A legacy SDR display is required");
+    }
 
     #[test]
     #[ignore = "requires an interactive Windows desktop and capture permission"]

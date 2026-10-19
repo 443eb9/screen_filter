@@ -3,7 +3,10 @@ use std::{ffi::OsString, mem::size_of, os::windows::ffi::OsStringExt, path::Path
 use windows::{
     Win32::{
         Devices::Display::*,
-        Foundation::{E_FAIL, ERROR_INSUFFICIENT_BUFFER, LUID},
+        Foundation::{
+            E_FAIL, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_FOUND,
+            ERROR_PROFILE_NOT_ASSOCIATED_WITH_DEVICE, GetLastError, LUID,
+        },
         Graphics::{
             Direct2D::{Common::*, *},
             Direct3D11::ID3D11Texture2D,
@@ -15,6 +18,9 @@ use windows::{
     core::{BOOL, Error, Interface, PCWSTR, PWSTR, Result},
 };
 
+// CLASS_MONITOR from icm.h, omitted from the Windows metadata bindings.
+const CLASS_MONITOR: u32 = u32::from_be_bytes(*b"mntr");
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ColorState {
     Advanced,
@@ -23,39 +29,73 @@ pub enum ColorState {
 
 impl ColorState {
     pub fn read(adapter_id: LUID, name: &[u16]) -> Result<Self> {
-        if Self::advanced_color_enabled(adapter_id, name)? {
+        let advanced = Self::advanced_color_enabled(adapter_id, name)?;
+        Self::from_profile_metadata(advanced, Self::profile_path(name)?)
+    }
+
+    fn from_profile_metadata(advanced: bool, path: Option<PathBuf>) -> Result<Self> {
+        if advanced {
+            if path.is_some() {
+                return Err(Error::new(
+                    E_FAIL,
+                    "Advanced Color exposes a legacy ICC profile. Clear the executable's legacy display ICC compatibility option",
+                ));
+            }
             return Ok(Self::Advanced);
         }
-
-        let path = Self::profile_path(name)?;
+        let path = path.ok_or_else(|| {
+            Error::new(
+                E_FAIL,
+                "An explicit display ICC profile association is required",
+            )
+        })?;
         let profile = std::fs::read(&path)
             .map_err(|error| Error::new(E_FAIL, format!("ICC {}: {error}", path.display())))?;
         if profile.len() < 128
             || &profile[36..40] != b"acsp"
             || &profile[16..20] != b"RGB "
-            || &profile[12..16] != b"mntr"
+            || profile[12..16] != CLASS_MONITOR.to_be_bytes()
         {
             return Err(Error::new(E_FAIL, "An RGB ICC display profile is required"));
         }
         Ok(Self::Legacy { path, profile })
     }
 
-    fn profile_path(name: &[u16]) -> Result<PathBuf> {
+    fn profile_path(name: &[u16]) -> Result<Option<PathBuf>> {
         unsafe {
-            let mut monitor = DISPLAY_DEVICEW {
-                cb: size_of::<DISPLAY_DEVICEW>() as u32,
-                ..Default::default()
-            };
-            EnumDisplayDevicesW(
-                PCWSTR(name.as_ptr()),
-                0,
-                &mut monitor,
-                EDD_GET_DEVICE_INTERFACE_NAME,
-            )
-            .ok()?;
+            let mut active = None;
+            for index in 0.. {
+                let mut monitor = DISPLAY_DEVICEW {
+                    cb: size_of::<DISPLAY_DEVICEW>() as u32,
+                    ..Default::default()
+                };
+                if !EnumDisplayDevicesW(
+                    PCWSTR(name.as_ptr()),
+                    index,
+                    &mut monitor,
+                    EDD_GET_DEVICE_INTERFACE_NAME,
+                )
+                .as_bool()
+                {
+                    break;
+                }
+                if monitor.StateFlags.contains(DISPLAY_DEVICE_ACTIVE) {
+                    if active.is_some() {
+                        return Err(Error::new(E_FAIL, "Display ICC association is ambiguous"));
+                    }
+                    active = Some(monitor);
+                }
+            }
+            let monitor = active.ok_or_else(|| {
+                Error::new(E_FAIL, "An active monitor is required for ICC lookup")
+            })?;
+            if monitor.DeviceKey[0] == 0 {
+                return Err(Error::new(
+                    E_FAIL,
+                    "Monitor device key is required for ICC lookup",
+                ));
+            }
             let key = PCWSTR(monitor.DeviceKey.as_ptr());
-            // CLASS_MONITOR from icm.h, omitted from the Windows metadata bindings.
-            const CLASS_MONITOR: u32 = u32::from_be_bytes(*b"mntr");
             let mut per_user = BOOL::default();
             WcsGetUsePerUserProfiles(key, CLASS_MONITOR, &mut per_user).ok()?;
             let scope = if per_user.as_bool() {
@@ -64,7 +104,7 @@ impl ColorState {
                 WCS_PROFILE_MANAGEMENT_SCOPE_SYSTEM_WIDE
             };
             let mut bytes = 0;
-            WcsGetDefaultColorProfileSize(
+            if !WcsGetDefaultColorProfileSize(
                 scope,
                 key,
                 CPT_ICC,
@@ -72,11 +112,26 @@ impl ColorState {
                 0,
                 &mut bytes,
             )
-            .ok()?;
-            if bytes == 0 || bytes % 2 != 0 {
+            .as_bool()
+            {
+                let error = GetLastError();
+                if matches!(
+                    error,
+                    ERROR_FILE_NOT_FOUND
+                        | ERROR_NOT_FOUND
+                        | ERROR_PROFILE_NOT_ASSOCIATED_WITH_DEVICE
+                ) {
+                    return Ok(None);
+                }
+                return Err(Error::from_hresult(error.to_hresult()));
+            }
+            if bytes == 0 {
+                return Ok(None);
+            }
+            if bytes % 2 != 0 {
                 return Err(Error::new(
                     E_FAIL,
-                    "A display ICC profile association is required",
+                    "ICC profile filename has an invalid UTF-16 size",
                 ));
             }
             let mut filename = vec![0; bytes as usize / 2];
@@ -96,7 +151,7 @@ impl ColorState {
                 .unwrap_or(filename.len());
             let path = PathBuf::from(OsString::from_wide(&filename[..end]));
             if path.is_absolute() {
-                return Ok(path);
+                return Ok(Some(path));
             }
 
             let mut bytes = 0;
@@ -110,7 +165,9 @@ impl ColorState {
                 .iter()
                 .position(|&c| c == 0)
                 .unwrap_or(directory.len());
-            Ok(PathBuf::from(OsString::from_wide(&directory[..end])).join(path))
+            Ok(Some(
+                PathBuf::from(OsString::from_wide(&directory[..end])).join(path),
+            ))
         }
     }
 
@@ -195,12 +252,26 @@ impl ColorState {
                         status as u32,
                     )));
                 }
-                const ADVANCED_COLOR_ENABLED: u32 = 1 << 1;
-                active = Some(info.Anonymous.value & ADVANCED_COLOR_ENABLED != 0);
+                active = Some(Self::advanced_color_active(info.Anonymous.value)?);
             }
             active
                 .ok_or_else(|| Error::new(E_FAIL, "Active display color configuration is required"))
         }
+    }
+
+    fn advanced_color_active(flags: u32) -> Result<bool> {
+        // Bit positions follow DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO in wingdi.h.
+        const ADVANCED_COLOR_ENABLED: u32 = 1 << 1;
+        const WIDE_COLOR_ENFORCED: u32 = 1 << 2;
+        const ADVANCED_COLOR_FORCE_DISABLED: u32 = 1 << 3;
+        let active = flags & (ADVANCED_COLOR_ENABLED | WIDE_COLOR_ENFORCED) != 0;
+        if active && flags & ADVANCED_COLOR_FORCE_DISABLED != 0 {
+            return Err(Error::new(
+                E_FAIL,
+                "Display reports conflicting Advanced Color flags",
+            ));
+        }
+        Ok(active)
     }
 
     pub fn validate_format(&self, format: DXGI_FORMAT) -> Result<()> {
@@ -237,6 +308,12 @@ pub struct ColorTransform {
 
 impl ColorTransform {
     pub fn new(device: &IDXGIDevice, profile: &[u8]) -> Result<Self> {
+        if u32::try_from(profile.len()).is_err() {
+            return Err(Error::new(
+                E_FAIL,
+                "ICC profile exceeds the Windows profile size limit",
+            ));
+        }
         unsafe {
             let context = D2D1CreateDevice(device, None)?
                 .CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
@@ -418,6 +495,34 @@ impl ColorTransform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_metadata_requires_explicit_legacy_profiles_and_guards_compatibility_mode() {
+        assert!(ColorState::from_profile_metadata(false, None).is_err());
+        assert_eq!(
+            ColorState::from_profile_metadata(true, None).unwrap(),
+            ColorState::Advanced
+        );
+        assert!(
+            ColorState::from_profile_metadata(true, Some(PathBuf::from("synthetic.icc"))).is_err()
+        );
+        assert!(
+            ColorState::from_profile_metadata(
+                false,
+                Some(PathBuf::from("tests/fixtures/srgb.icc"))
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn advanced_color_flags_cover_hdr_wcg_and_conflicting_states() {
+        assert!(!ColorState::advanced_color_active(0).unwrap());
+        assert!(ColorState::advanced_color_active(0b0010).unwrap());
+        assert!(ColorState::advanced_color_active(0b0100).unwrap());
+        assert!(!ColorState::advanced_color_active(0b1000).unwrap());
+        assert!(ColorState::advanced_color_active(0b1010).is_err());
+    }
 
     #[test]
     fn advanced_color_requires_float_capture() {
