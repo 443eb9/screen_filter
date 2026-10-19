@@ -25,22 +25,9 @@ SamplerState samplerState : register(s0);
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-float gamma_to_linear(float x) {
-    if (x <= 0.0) return x;
-    if (x <= 0.04045) return x / 12.92;
-    return pow((x + 0.055) / 1.055, 2.4);
-}
-
 float4 main(float4 pos : SV_Position, float2 tex : TEXCOORD) : SV_Target {
-    float4 color = screenTexture.Sample(samplerState, tex);
-    float r = gamma_to_linear(color.r);
-    float g = gamma_to_linear(color.g);
-    float b = gamma_to_linear(color.b);
-
-    float y = r * 0.2126729 + g * 0.7151522 + b * 0.072175;
-    const float CIE_EPSILON = 216.0 / 24389.0;
-    const float CIE_KAPPA = 24389.0 / 27.0;
-    float fy = y > CIE_EPSILON ? pow(y, 1.0 / 3.0) : (CIE_KAPPA * y + 16.0) / 116.0;
-    float l = 1.16 * fy - 0.16;
-    return float4(l, l, l, 1.0f);
+    float3 rgb = screenTexture.SampleLevel(samplerState, tex, 0).rgb;
+    // Preserving CIELAB L* and setting a*=b*=0 preserves relative luminance Y.
+    float gray = dot(rgb, float3(0.2126729f, 0.7151522f, 0.0721750f));
+    return float4(gray, gray, gray, 1.0f);
 }

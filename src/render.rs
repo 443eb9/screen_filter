@@ -1,690 +1,617 @@
-#![allow(non_snake_case)]
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
-use std::ffi::c_void;
-use std::mem::{size_of, zeroed};
-use std::slice;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use crossbeam_channel::{Receiver, RecvTimeoutError};
+use windows::{
+    Win32::{
+        Foundation::{E_FAIL, LUID},
+        Graphics::{
+            Direct3D::D3D_DRIVER_TYPE_UNKNOWN,
+            Direct3D11::*,
+            DirectComposition::*,
+            Dxgi::{Common::*, *},
+        },
+    },
+    core::{Error, Interface, Result},
+};
 
-use crossbeam_channel::{Receiver, TryRecvError};
-use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Direct3D::Fxc::*;
-use windows::Win32::Graphics::Direct3D::*;
-use windows::Win32::Graphics::Direct3D11::*;
-use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::Win32::Graphics::Dxgi::*;
-use windows::Win32::System::LibraryLoader::*;
-use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::*;
+use crate::{
+    color::{ColorState, ColorTransform},
+    gpu::{Gpu, Texture},
+    window::{Overlay, WindowClass},
+};
 
-use crate::APP_ID;
-
-pub static ENABLED: AtomicBool = AtomicBool::new(false);
-pub static FROZEN: AtomicBool = AtomicBool::new(false);
-
-#[repr(C)]
-struct SimpleVertex {
-    x: f32,
-    y: f32,
-    u: f32,
-    v: f32,
+#[derive(Default)]
+pub struct FilterControl {
+    pub enabled: AtomicBool,
+    pub frozen: AtomicBool,
 }
-
-struct OutputDup {
-    dup: IDXGIOutputDuplication,
-    desktop_rect: RECT,
-    width: u32,
-    height: u32,
-    dest_tex: ID3D11Texture2D,
-    dest_srv: ID3D11ShaderResourceView,
-}
-
-struct Globals {
-    device: ID3D11Device,
-    ctx: ID3D11DeviceContext,
-    swap_chain: IDXGISwapChain,
-    rtv: ID3D11RenderTargetView,
-    vs: ID3D11VertexShader,
-    input_layout: ID3D11InputLayout,
-    vb: ID3D11Buffer,
-    sampler: ID3D11SamplerState,
-    outputs: Vec<OutputDup>,
-}
-
-struct FragmentShader {
-    ps: ID3D11PixelShader,
-}
-
-unsafe extern "system" fn WndProc(hWnd: HWND, msg: u32, wParam: WPARAM, lParam: LPARAM) -> LRESULT {
-    match msg {
-        WM_DESTROY => {
-            unsafe { PostQuitMessage(0) };
-            LRESULT(0)
-        }
-        _ => unsafe { DefWindowProcA(hWnd, msg, wParam, lParam) },
-    }
-}
-
-const VS_SRC: &str = r#"
-void main(in float2 pos : POSITION, in float2 tex : TEXCOORD,
-          out float4 outPos : SV_Position, out float2 outTex : TEXCOORD)
-{
-    outPos = float4(pos, 0.0f, 1.0f);
-    outTex = tex;
-}
-"#;
 
 pub fn render_loop(
     fragment: &'static str,
     refresh_rate: u32,
     terminator: Receiver<()>,
-) -> windows::core::Result<()> {
-    unsafe {
-        let hinstance = GetModuleHandleA(None)?;
-        let class_name = s!("DX11ScreenFilter");
+    control: Arc<FilterControl>,
+) -> Result<()> {
+    let class = WindowClass::new()?;
+    let mut monitors = Vec::<MonitorSlot>::new();
+    let mut next_scan = Instant::now();
+    let mut next_frame = Instant::now();
+    let interval = if refresh_rate == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs_f64(1.0 / refresh_rate as f64)
+    };
 
-        let wc = WNDCLASSEXA {
-            cbSize: size_of::<WNDCLASSEXA>() as u32,
-            style: CS_HREDRAW | CS_VREDRAW,
-            lpfnWndProc: Some(WndProc),
-            hInstance: hinstance.into(),
-            lpszClassName: class_name,
-            ..Default::default()
-        };
-        RegisterClassExA(&wc);
-
-        let virt_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
-        let virt_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        let virt_w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-        let virt_h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-
-        let hWnd = CreateWindowExA(
-            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-            class_name,
-            PCSTR::from_raw(APP_ID.as_ptr()),
-            WS_POPUP,
-            virt_left,
-            virt_top,
-            virt_w,
-            virt_h,
-            None,
-            None,
-            Some(hinstance.into()),
-            None,
-        )?;
-
-        SetLayeredWindowAttributes(hWnd, COLORREF(0), 255, LWA_ALPHA)?;
-
-        let mut g = init_d3d11(hWnd)?;
-        init_duplications(&mut g)?;
-        let frag = compile_shader(&g, fragment)?;
-
-        init_atomics(hWnd);
-
-        let mut current_visible = ENABLED.load(Ordering::Relaxed);
-        let mut current_frozen = FROZEN.load(Ordering::Relaxed);
-
-        let mut last_render = Instant::now();
-        let frame_time = 1.0 / refresh_rate as f32;
-
-        loop {
-            let terminator = terminator.try_recv();
-            if terminator.is_ok() || terminator.is_err_and(|e| e == TryRecvError::Disconnected) {
-                log::info!("Terminating render loop.");
-                let _ = DestroyWindow(hWnd);
-                break Ok(());
-            }
-
-            let enabled = ENABLED.load(Ordering::Relaxed);
-            let frozen = FROZEN.load(Ordering::Relaxed);
-
-            if current_visible != enabled {
-                current_visible = enabled;
-                update_enabled(hWnd);
-
-                if frozen {
-                    render(&mut g, &frag);
+    loop {
+        if !class.process_messages()
+            || monitors.iter().any(|slot| {
+                slot.monitor
+                    .as_ref()
+                    .is_some_and(|monitor| monitor.overlay.closed())
+            })
+        {
+            return Ok(());
+        }
+        if monitors.iter().any(|slot| {
+            slot.monitor
+                .as_ref()
+                .is_some_and(|monitor| monitor.overlay.changed())
+        }) {
+            next_scan = Instant::now();
+        }
+        let now = Instant::now();
+        if now >= next_scan {
+            let snapshot = unsafe { CreateDXGIFactory1::<IDXGIFactory2>() }
+                .and_then(|factory| MonitorSpec::enumerate(&factory).map(|specs| (factory, specs)));
+            match snapshot {
+                Ok((factory, specs)) => {
+                    let mut previous = std::mem::take(&mut monitors);
+                    for spec in specs {
+                        let mut slot = previous
+                            .iter()
+                            .position(|slot| slot.spec.same_display(&spec))
+                            .map(|index| previous.swap_remove(index))
+                            .unwrap_or_else(|| MonitorSlot::new(spec.clone()));
+                        slot.refresh(spec, &factory, &class, fragment);
+                        monitors.push(slot);
+                    }
+                }
+                Err(error) => {
+                    for slot in &mut monitors {
+                        slot.pause(&error);
+                    }
+                    log::error!("Display enumeration failed: {error}");
                 }
             }
+            next_scan = now + Duration::from_secs(1);
+        }
 
-            if current_frozen != frozen {
-                current_frozen = frozen;
-                update_frozen(hWnd);
+        let enabled = control.enabled.load(Ordering::Relaxed);
+        let frozen = control.frozen.load(Ordering::Relaxed);
+        let draw = now >= next_frame;
+        for slot in &mut monitors {
+            if let Some(monitor) = &mut slot.monitor
+                && let Err(error) = monitor.tick(enabled, frozen, draw)
+            {
+                slot.pause(&error);
+            } else if slot.monitor.as_ref().is_some_and(|monitor| monitor.ready) {
+                slot.last_error = None;
             }
+        }
+        if draw {
+            next_frame = now + interval;
+        }
 
-            if enabled && !frozen {
-                if last_render.elapsed().as_secs_f32() > frame_time {
-                    render(&mut g, &frag);
-                    last_render = Instant::now();
+        let wait = if enabled && !frozen {
+            Duration::from_millis(1)
+        } else {
+            Duration::from_millis(20)
+        };
+        match terminator.recv_timeout(wait) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MonitorSpec {
+    adapter: IDXGIAdapter1,
+    output: IDXGIOutput,
+    adapter_id: LUID,
+    desc: DXGI_OUTPUT_DESC,
+}
+
+impl MonitorSpec {
+    fn enumerate(factory: &IDXGIFactory2) -> Result<Vec<Self>> {
+        let mut specs = Vec::new();
+        unsafe {
+            let mut adapter_index = 0;
+            loop {
+                let adapter = match factory.EnumAdapters1(adapter_index) {
+                    Ok(adapter) => adapter,
+                    Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
+                    Err(error) => return Err(error),
+                };
+                let adapter_id = adapter.GetDesc1()?.AdapterLuid;
+                let mut output_index = 0;
+                loop {
+                    let output = match adapter.EnumOutputs(output_index) {
+                        Ok(output) => output,
+                        Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
+                        Err(error) => return Err(error),
+                    };
+                    let desc = output.GetDesc()?;
+                    if desc.AttachedToDesktop.as_bool() {
+                        specs.push(Self {
+                            adapter: adapter.clone(),
+                            output,
+                            adapter_id,
+                            desc,
+                        });
+                    }
+                    output_index += 1;
                 }
-            } else {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                adapter_index += 1;
             }
         }
+        Ok(specs)
+    }
+
+    fn same_display(&self, other: &Self) -> bool {
+        self.adapter_id == other.adapter_id && self.desc.DeviceName == other.desc.DeviceName
+    }
+
+    fn same_layout(&self, other: &Self) -> bool {
+        self.same_display(other)
+            && self.desc.DesktopCoordinates == other.desc.DesktopCoordinates
+            && self.desc.Rotation == other.desc.Rotation
+    }
+
+    fn name(&self) -> String {
+        let end = self
+            .desc
+            .DeviceName
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(self.desc.DeviceName.len());
+        String::from_utf16_lossy(&self.desc.DeviceName[..end])
+    }
+
+    fn dimensions(&self) -> Result<(u32, u32)> {
+        let rect = self.desc.DesktopCoordinates;
+        let width = u32::try_from(rect.right - rect.left)
+            .map_err(|_| Error::new(E_FAIL, "Invalid display width"))?;
+        let height = u32::try_from(rect.bottom - rect.top)
+            .map_err(|_| Error::new(E_FAIL, "Invalid display height"))?;
+        if width == 0 || height == 0 {
+            return Err(Error::new(E_FAIL, "Display dimensions must be positive"));
+        }
+        Ok((width, height))
     }
 }
 
-unsafe fn init_atomics(hWnd: HWND) {
-    unsafe {
-        let _ = ShowWindow(hWnd, SW_HIDE);
-        ENABLED.store(false, Ordering::Relaxed);
-
-        let _ = SetWindowDisplayAffinity(hWnd, WDA_EXCLUDEFROMCAPTURE);
-        FROZEN.store(false, Ordering::Relaxed);
-    }
+struct MonitorSlot {
+    spec: MonitorSpec,
+    monitor: Option<Monitor>,
+    last_error: Option<String>,
 }
 
-unsafe fn update_enabled(hWnd: HWND) {
-    unsafe {
-        if ENABLED.load(Ordering::Relaxed) {
-            log::info!("Showing filter window");
-            let _ = ShowWindow(hWnd, SW_SHOW);
-        } else {
-            log::info!("Hiding filter window");
-            let _ = ShowWindow(hWnd, SW_HIDE);
+impl MonitorSlot {
+    fn new(spec: MonitorSpec) -> Self {
+        Self {
+            spec,
+            monitor: None,
+            last_error: None,
+        }
+    }
+
+    fn refresh(
+        &mut self,
+        spec: MonitorSpec,
+        factory: &IDXGIFactory2,
+        class: &WindowClass,
+        fragment: &str,
+    ) {
+        let color = match ColorState::read(spec.adapter_id, &spec.desc.DeviceName) {
+            Ok(color) => color,
+            Err(error) => {
+                self.spec = spec;
+                self.pause(&error);
+                return;
+            }
+        };
+        if self.spec.same_layout(&spec)
+            && self
+                .monitor
+                .as_ref()
+                .is_some_and(|monitor| monitor.color == color)
+        {
+            self.spec = spec;
+            return;
+        }
+        self.monitor.take();
+        self.spec = spec;
+        match Monitor::new(&self.spec, color, factory, class, fragment) {
+            Ok(monitor) => {
+                log::info!("Display {} resources created", self.spec.name());
+                self.monitor = Some(monitor);
+            }
+            Err(error) => self.pause(&error),
+        }
+    }
+
+    fn pause(&mut self, error: &Error) {
+        self.monitor.take();
+        let message = format!("{}: {error}", self.spec.name());
+        if self.last_error.as_ref() != Some(&message) {
+            log::error!("Display paused: {message}");
+            crate::notify("Screen Filter display paused", &message);
+            self.last_error = Some(message);
         }
     }
 }
 
-unsafe fn update_frozen(hWnd: HWND) {
-    unsafe {
-        if FROZEN.load(Ordering::Relaxed) {
-            log::info!("Freezing filter");
-            let _ = SetWindowDisplayAffinity(hWnd, WDA_NONE);
-        } else {
-            log::info!("Unfreezing filter");
-            let _ = SetWindowDisplayAffinity(hWnd, WDA_EXCLUDEFROMCAPTURE);
-        }
-    }
+struct Monitor {
+    gpu: Gpu,
+    duplication: IDXGIOutputDuplication,
+    swap_chain: IDXGISwapChain3,
+    _composition: IDCompositionDevice,
+    _target: IDCompositionTarget,
+    _visual: IDCompositionVisual,
+    transform: Option<ColorTransform>,
+    frames: Option<FrameTextures>,
+    color: ColorState,
+    adapter_id: LUID,
+    device_name: [u16; 32],
+    rotation: DXGI_MODE_ROTATION,
+    width: u32,
+    height: u32,
+    ready: bool,
+    frozen: bool,
+    overlay: Overlay,
 }
 
-unsafe fn init_d3d11(hWnd: HWND) -> windows::core::Result<Globals> {
-    unsafe {
-        let virt_w = GetSystemMetrics(SM_CXVIRTUALSCREEN) as u32;
-        let virt_h = GetSystemMetrics(SM_CYVIRTUALSCREEN) as u32;
-
-        let sd = DXGI_SWAP_CHAIN_DESC {
-            BufferCount: 1,
-            BufferDesc: DXGI_MODE_DESC {
-                Width: virt_w,
-                Height: virt_h,
-                RefreshRate: DXGI_RATIONAL {
-                    Numerator: 60,
-                    Denominator: 1,
-                },
-                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                ..Default::default()
-            },
-            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-            OutputWindow: hWnd,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Windowed: BOOL(1),
-            SwapEffect: DXGI_SWAP_EFFECT_DISCARD,
-            ..Default::default()
-        };
-
-        let mut device: Option<ID3D11Device> = None;
-        let mut ctx: Option<ID3D11DeviceContext> = None;
-        let mut swap_chain: Option<IDXGISwapChain> = None;
-
-        let feature_levels = [D3D_FEATURE_LEVEL_11_0];
-        let mut got_level = D3D_FEATURE_LEVEL_11_0;
-
-        D3D11CreateDeviceAndSwapChain(
-            None,
-            D3D_DRIVER_TYPE_HARDWARE,
-            Default::default(),
-            D3D11_CREATE_DEVICE_FLAG(0),
-            Some(&feature_levels),
-            D3D11_SDK_VERSION,
-            Some(&sd),
-            Some(&mut swap_chain),
-            Some(&mut device),
-            Some(&mut got_level),
-            Some(&mut ctx),
-        )?;
-
-        let device = device.unwrap();
-        let ctx = ctx.unwrap();
-        let swap_chain = swap_chain.unwrap();
-
-        let backbuf = swap_chain.GetBuffer::<ID3D11Texture2D>(0)?;
-
-        let rtv = {
-            let mut rtv: Option<ID3D11RenderTargetView> = None;
-            device.CreateRenderTargetView(&backbuf, None, Some(&mut rtv))?;
-            rtv.unwrap()
-        };
-        ctx.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
-
-        let vp = D3D11_VIEWPORT {
-            TopLeftX: 0.0,
-            TopLeftY: 0.0,
-            Width: virt_w as f32,
-            Height: virt_h as f32,
-            MinDepth: 0.0,
-            MaxDepth: 1.0,
-        };
-        ctx.RSSetViewports(Some(&[vp]));
-
-        let sampler = {
-            let desc = D3D11_SAMPLER_DESC {
-                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
-                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
-                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
-                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
-                MinLOD: 0.0,
-                MaxLOD: f32::MAX,
-                ..Default::default()
+impl Monitor {
+    fn new(
+        spec: &MonitorSpec,
+        color: ColorState,
+        factory: &IDXGIFactory2,
+        class: &WindowClass,
+        fragment: &str,
+    ) -> Result<Self> {
+        let (width, height) = spec.dimensions()?;
+        let overlay = class
+            .create(spec.desc.DesktopCoordinates)
+            .map_err(|error| Error::new(error.code(), format!("Overlay creation: {error}")))?;
+        unsafe {
+            let adapter = spec.adapter.cast::<IDXGIAdapter>()?;
+            let gpu = Gpu::new(Some(&adapter), D3D_DRIVER_TYPE_UNKNOWN, fragment)?;
+            let dxgi_device = gpu.device.cast::<IDXGIDevice>()?;
+            let transform = match &color {
+                ColorState::Advanced => None,
+                ColorState::Legacy { profile, .. } => {
+                    Some(ColorTransform::new(&dxgi_device, profile).map_err(|error| {
+                        Error::new(error.code(), format!("ICC transform creation: {error}"))
+                    })?)
+                }
             };
-            let mut s: Option<ID3D11SamplerState> = None;
-            device.CreateSamplerState(&desc, Some(&mut s))?;
-            s.unwrap()
+            let duplication = spec
+                .output
+                .cast::<IDXGIOutput5>()?
+                .DuplicateOutput1(
+                    &gpu.device,
+                    0,
+                    &[
+                        DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        DXGI_FORMAT_B8G8R8A8_UNORM,
+                        DXGI_FORMAT_R8G8B8A8_UNORM,
+                    ],
+                )
+                .map_err(|error| {
+                    Error::new(
+                        error.code(),
+                        format!("Desktop duplication creation: {error}"),
+                    )
+                })?;
+            let swap_chain = factory
+                .CreateSwapChainForComposition(
+                    &gpu.device,
+                    &DXGI_SWAP_CHAIN_DESC1 {
+                        Width: width,
+                        Height: height,
+                        Format: color.output_format(),
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                        BufferCount: 2,
+                        Scaling: DXGI_SCALING_STRETCH,
+                        SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+                        AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .map_err(|error| {
+                    Error::new(
+                        error.code(),
+                        format!("Composition swap chain creation: {error}"),
+                    )
+                })?
+                .cast::<IDXGISwapChain3>()?;
+            if matches!(color, ColorState::Advanced) {
+                let space = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+                if swap_chain.CheckColorSpaceSupport(space)?
+                    & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32
+                    == 0
+                {
+                    return Err(Error::new(E_FAIL, "scRGB presentation is required"));
+                }
+                swap_chain.SetColorSpace1(space)?;
+            }
+            let composition = DCompositionCreateDevice::<_, IDCompositionDevice>(&dxgi_device)?;
+            let target = composition
+                .CreateTargetForHwnd(overlay.handle, true)
+                .map_err(|error| {
+                    Error::new(error.code(), format!("Composition window target: {error}"))
+                })?;
+            let visual = composition.CreateVisual()?;
+            visual.SetContent(&swap_chain)?;
+            target.SetRoot(&visual)?;
+            composition.Commit()?;
+            Ok(Self {
+                gpu,
+                duplication,
+                swap_chain,
+                _composition: composition,
+                _target: target,
+                _visual: visual,
+                transform,
+                frames: None,
+                color,
+                adapter_id: spec.adapter_id,
+                device_name: spec.desc.DeviceName,
+                rotation: spec.desc.Rotation,
+                width,
+                height,
+                ready: false,
+                frozen: false,
+                overlay,
+            })
+        }
+    }
+
+    fn tick(&mut self, enabled: bool, frozen: bool, draw: bool) -> Result<()> {
+        if self.frozen && !frozen {
+            self.overlay.set_frozen(false)?;
+            self.frozen = false;
+        }
+        if enabled && draw && (!frozen || !self.ready) {
+            self.capture()?;
+        }
+        if frozen && self.ready && !self.frozen {
+            self.overlay.set_frozen(true)?;
+            self.frozen = true;
+        }
+        self.overlay.show(enabled && self.ready);
+        Ok(())
+    }
+
+    fn capture(&mut self) -> Result<()> {
+        let Some(frame) = AcquiredFrame::next(&self.duplication)? else {
+            return Ok(());
         };
-
-        let (vs, input_layout) = {
-            let mut vs_blob: Option<ID3DBlob> = None;
-            let mut err_blob: Option<ID3DBlob> = None;
-
-            D3DCompile(
-                VS_SRC.as_ptr() as _,
-                VS_SRC.len(),
-                None,
-                None,
-                None,
-                s!("main"),
-                s!("vs_5_0"),
-                0,
-                0,
-                &mut vs_blob,
-                Some(&mut err_blob),
-            )?;
-            let vs_blob = vs_blob.unwrap();
-            let vs_blob_slice = slice::from_raw_parts(
-                vs_blob.GetBufferPointer() as *const u8,
-                vs_blob.GetBufferSize(),
+        self.validate_color_state()?;
+        unsafe {
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            frame.texture.GetDesc(&mut desc);
+            self.color.validate_format(desc.Format)?;
+            let rotated = matches!(
+                self.rotation,
+                DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE270
             );
-
-            let mut vs: Option<ID3D11VertexShader> = None;
-            device.CreateVertexShader(vs_blob_slice, None, Some(&mut vs))?;
-            let vs = vs.unwrap();
-
-            let layout_desc = [
-                D3D11_INPUT_ELEMENT_DESC {
-                    SemanticName: s!("POSITION"),
-                    SemanticIndex: 0,
-                    Format: DXGI_FORMAT_R32G32_FLOAT,
-                    InputSlot: 0,
-                    AlignedByteOffset: 0,
-                    InputSlotClass: D3D11_INPUT_PER_VERTEX_DATA,
-                    InstanceDataStepRate: 0,
-                },
-                D3D11_INPUT_ELEMENT_DESC {
-                    SemanticName: s!("TEXCOORD"),
-                    SemanticIndex: 0,
-                    Format: DXGI_FORMAT_R32G32_FLOAT,
-                    InputSlot: 0,
-                    AlignedByteOffset: 8,
-                    InputSlotClass: D3D11_INPUT_PER_VERTEX_DATA,
-                    InstanceDataStepRate: 0,
-                },
-            ];
-
-            let mut il: Option<ID3D11InputLayout> = None;
-            device.CreateInputLayout(&layout_desc, vs_blob_slice, Some(&mut il))?;
-            let il = il.unwrap();
-            (vs, il)
-        };
-
-        let vb = {
-            let vertices = [
-                SimpleVertex {
-                    x: -1.0,
-                    y: 1.0,
-                    u: 0.0,
-                    v: 0.0,
-                },
-                SimpleVertex {
-                    x: 1.0,
-                    y: 1.0,
-                    u: 1.0,
-                    v: 0.0,
-                },
-                SimpleVertex {
-                    x: -1.0,
-                    y: -1.0,
-                    u: 0.0,
-                    v: 1.0,
-                },
-                SimpleVertex {
-                    x: 1.0,
-                    y: -1.0,
-                    u: 1.0,
-                    v: 1.0,
-                },
-            ];
-            let bd = D3D11_BUFFER_DESC {
-                ByteWidth: size_of::<SimpleVertex>() as u32 * 4,
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: D3D11_BIND_VERTEX_BUFFER.0 as u32,
-                ..Default::default()
+            let expected = if rotated {
+                (self.height, self.width)
+            } else {
+                (self.width, self.height)
             };
-            let init = D3D11_SUBRESOURCE_DATA {
-                pSysMem: vertices.as_ptr() as *const c_void,
-                ..Default::default()
-            };
-            let mut buf: Option<ID3D11Buffer> = None;
-            device.CreateBuffer(&bd, Some(&init), Some(&mut buf))?;
-            buf.unwrap()
-        };
+            if (desc.Width, desc.Height) != expected {
+                return Err(Error::new(
+                    E_FAIL,
+                    "Capture dimensions changed, rebuilding display resources",
+                ));
+            }
+            if self
+                .frames
+                .as_ref()
+                .is_some_and(|frames| frames.format != desc.Format)
+            {
+                return Err(Error::new(
+                    E_FAIL,
+                    "Capture format changed, rebuilding display resources",
+                ));
+            }
+            if self.frames.is_none() {
+                self.frames = Some(FrameTextures::new(
+                    &self.gpu,
+                    &self.color,
+                    &desc,
+                    self.width,
+                    self.height,
+                )?);
+            }
+            let frames = self.frames.as_ref().expect("Frame textures initialized");
+            self.gpu
+                .context
+                .CopyResource(&frames.input.raw, &frame.texture);
+            frame.release()?;
+            let back_buffer = self.swap_chain.GetBuffer::<ID3D11Texture2D>(0)?;
+            if let Some(transform) = &self.transform {
+                let (linear, gray) = frames
+                    .legacy
+                    .as_ref()
+                    .expect("Legacy color transforms have linear frame textures");
+                transform.decode(&frames.input.raw, &linear.raw)?;
+                self.gpu.draw(linear, &gray.raw, self.rotation)?;
+                transform.encode(&gray.raw, &back_buffer)?;
+            } else {
+                self.gpu.draw(&frames.input, &back_buffer, self.rotation)?;
+            }
+            self.validate_color_state()?;
+            self.swap_chain.Present(0, DXGI_PRESENT::default()).ok()?;
+            self.gpu.device.GetDeviceRemovedReason()?;
+            self.ready = true;
+        }
+        Ok(())
+    }
+}
 
-        Ok(Globals {
-            device,
-            ctx,
-            swap_chain,
-            rtv,
-            vs,
-            input_layout,
-            vb,
-            sampler,
-            outputs: Vec::new(),
+impl Monitor {
+    fn validate_color_state(&self) -> Result<()> {
+        if ColorState::read(self.adapter_id, &self.device_name)? != self.color {
+            return Err(Error::new(
+                E_FAIL,
+                "Display color configuration changed during capture",
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct FrameTextures {
+    input: Texture,
+    legacy: Option<(Texture, Texture)>,
+    format: DXGI_FORMAT,
+}
+
+impl FrameTextures {
+    fn new(
+        gpu: &Gpu,
+        color: &ColorState,
+        desc: &D3D11_TEXTURE2D_DESC,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        let input = gpu.texture(desc.Width, desc.Height, desc.Format)?;
+        let legacy = match color {
+            ColorState::Advanced => None,
+            ColorState::Legacy { .. } => Some((
+                gpu.texture(desc.Width, desc.Height, DXGI_FORMAT_R32G32B32A32_FLOAT)?,
+                gpu.texture(width, height, DXGI_FORMAT_R32G32B32A32_FLOAT)?,
+            )),
+        };
+        Ok(Self {
+            input,
+            legacy,
+            format: desc.Format,
         })
     }
 }
 
-unsafe fn compile_shader(globals: &Globals, code: &str) -> windows::core::Result<FragmentShader> {
-    unsafe {
-        let mut ps_blob: Option<ID3DBlob> = None;
-        let mut err_blob: Option<ID3DBlob> = None;
-
-        D3DCompile(
-            code.as_ptr() as _,
-            code.len(),
-            None,
-            None,
-            None,
-            s!("main"),
-            s!("ps_5_0"),
-            0,
-            0,
-            &mut ps_blob,
-            Some(&mut err_blob),
-        )?;
-        let ps_blob = ps_blob.unwrap();
-        let ps_blob_slice = slice::from_raw_parts(
-            ps_blob.GetBufferPointer() as *const u8,
-            ps_blob.GetBufferSize(),
-        );
-
-        let mut ps: Option<ID3D11PixelShader> = None;
-        globals
-            .device
-            .CreatePixelShader(ps_blob_slice, None, Some(&mut ps))?;
-        Ok(FragmentShader { ps: ps.unwrap() })
-    }
+struct AcquiredFrame {
+    duplication: IDXGIOutputDuplication,
+    texture: ID3D11Texture2D,
+    released: bool,
 }
 
-unsafe fn init_duplications(g: &mut Globals) -> windows::core::Result<()> {
-    unsafe {
-        g.outputs.clear();
-
-        let dxgi_device = g.device.cast::<IDXGIDevice>()?;
-
-        let adapter = dxgi_device.GetParent::<IDXGIAdapter>()?;
-
-        let mut i = 0;
-        while let Ok(output) = adapter.EnumOutputs(i) {
-            let output1 = output.cast::<IDXGIOutput1>()?;
-
-            let outdesc = output.GetDesc()?;
-
-            let dup = output1.DuplicateOutput(&g.device)?;
-            let dud = dup.GetDesc();
-
-            let desc = D3D11_TEXTURE2D_DESC {
-                Width: dud.ModeDesc.Width,
-                Height: dud.ModeDesc.Height,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
-                ..Default::default()
-            };
-            let mut tex: Option<ID3D11Texture2D> = None;
-            g.device.CreateTexture2D(&desc, None, Some(&mut tex))?;
-            let tex = tex.unwrap();
-
-            let srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
-                Format: desc.Format,
-                ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2D,
-                Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
-                    Texture2D: D3D11_TEX2D_SRV {
-                        MostDetailedMip: 0,
-                        MipLevels: 1,
-                    },
-                },
-            };
-            let mut srv: Option<ID3D11ShaderResourceView> = None;
-            g.device
-                .CreateShaderResourceView(&tex, Some(&srv_desc), Some(&mut srv))?;
-            let srv = srv.unwrap();
-
-            g.outputs.push(OutputDup {
-                dup,
-                desktop_rect: outdesc.DesktopCoordinates,
-                width: dud.ModeDesc.Width,
-                height: dud.ModeDesc.Height,
-                dest_tex: tex,
-                dest_srv: srv,
-            });
-
-            i += 1;
-        }
-
-        if g.outputs.is_empty() {
-            Err(E_FAIL.into())
-        } else {
-            Ok(())
-        }
-    }
-}
-
-unsafe fn capture_desktop_per_output(g: &mut Globals) {
-    unsafe {
-        if g.outputs.is_empty() {
-            return;
-        }
-        let mut need_reinit = false;
-
-        for od in &mut g.outputs {
-            let mut frame_info: DXGI_OUTDUPL_FRAME_INFO = zeroed();
-            let mut desktop_res: Option<IDXGIResource> = None;
-
-            match od
-                .dup
-                .AcquireNextFrame(0, &mut frame_info, &mut desktop_res)
-            {
-                Ok(_) => {}
-                Err(err) => {
-                    let code = err.code().0;
-                    if code == DXGI_ERROR_WAIT_TIMEOUT.0 {
-                        continue;
-                    } else if code == DXGI_ERROR_ACCESS_LOST.0 {
-                        need_reinit = true;
-                        continue;
-                    } else {
-                        continue;
-                    }
+impl AcquiredFrame {
+    fn next(duplication: &IDXGIOutputDuplication) -> Result<Option<Self>> {
+        unsafe {
+            let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+            let mut resource = None;
+            match duplication.AcquireNextFrame(0, &mut info, &mut resource) {
+                Ok(()) => {}
+                Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
+                Err(error) => return Err(error),
+            }
+            let result = (|| {
+                if info.ProtectedContentMaskedOut.as_bool() {
+                    return Err(Error::new(
+                        E_FAIL,
+                        "Protected content is masked in this capture",
+                    ));
                 }
-            };
-            let desktop_res = desktop_res.unwrap();
-
-            let src_tex = match desktop_res.cast::<ID3D11Texture2D>() {
-                Ok(texture) => texture,
+                resource
+                    .ok_or_else(|| Error::new(E_FAIL, "Captured resource is required"))?
+                    .cast::<ID3D11Texture2D>()
+            })();
+            match result {
+                Ok(texture) => Ok(Some(Self {
+                    duplication: duplication.clone(),
+                    texture,
+                    released: false,
+                })),
                 Err(error) => {
-                    log::error!("Capture texture conversion failed: {error}");
-                    let _ = od.dup.ReleaseFrame();
-                    continue;
-                }
-            };
-
-            let mut src_desc: D3D11_TEXTURE2D_DESC = Default::default();
-            src_tex.GetDesc(&mut src_desc);
-
-            let dest_fmt = DXGI_FORMAT_B8G8R8A8_UNORM;
-
-            if src_desc.Format == dest_fmt
-                && src_desc.Width == od.width
-                && src_desc.Height == od.height
-            {
-                let box_ = D3D11_BOX {
-                    left: 0,
-                    top: 0,
-                    front: 0,
-                    right: src_desc.Width,
-                    bottom: src_desc.Height,
-                    back: 1,
-                };
-                g.ctx
-                    .CopySubresourceRegion(&od.dest_tex, 0, 0, 0, 0, &src_tex, 0, Some(&box_));
-            } else if (src_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM
-                || src_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM)
-                && src_desc.Width == od.width
-                && src_desc.Height == od.height
-            {
-                let mut staging_desc = src_desc;
-                staging_desc.Usage = D3D11_USAGE_STAGING;
-                staging_desc.BindFlags = 0;
-                staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
-                staging_desc.MiscFlags = 0;
-                staging_desc.SampleDesc.Count = 1;
-
-                let mut staging: Option<ID3D11Texture2D> = None;
-                if g.device
-                    .CreateTexture2D(&staging_desc, None, Some(&mut staging))
-                    .is_ok()
-                {
-                    let staging = staging.unwrap();
-                    g.ctx.CopyResource(&staging, &src_tex);
-
-                    let mut mapped: D3D11_MAPPED_SUBRESOURCE = zeroed();
-                    if g.ctx
-                        .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-                        .is_ok()
-                    {
-                        let row_bytes = od.width as usize * 4;
-                        let total = row_bytes * od.height as usize;
-                        let mut full = vec![0u8; total];
-
-                        let src_is_rgba = src_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM;
-                        for y in 0..od.height {
-                            let srow = (mapped.pData as *const u8)
-                                .add(y as usize * mapped.RowPitch as usize);
-                            let drow = full.as_mut_ptr().add(y as usize * row_bytes);
-                            if src_is_rgba {
-                                for x in 0..od.width {
-                                    let r = *srow.add(4 * x as usize);
-                                    let g = *srow.add(4 * x as usize + 1);
-                                    let b = *srow.add(4 * x as usize + 2);
-                                    let a = *srow.add(4 * x as usize + 3);
-                                    *drow.add(4 * x as usize) = b;
-                                    *drow.add(4 * x as usize + 1) = g;
-                                    *drow.add(4 * x as usize + 2) = r;
-                                    *drow.add(4 * x as usize + 3) = a;
-                                }
-                            } else {
-                                std::ptr::copy_nonoverlapping(srow, drow, row_bytes);
-                            }
-                        }
-                        g.ctx.Unmap(&staging, 0);
-
-                        g.ctx.UpdateSubresource(
-                            &od.dest_tex,
-                            0,
-                            None,
-                            full.as_ptr() as *const c_void,
-                            row_bytes as u32,
-                            0,
-                        );
-                    }
+                    let _ = duplication.ReleaseFrame();
+                    Err(error)
                 }
             }
-
-            let _ = od.dup.ReleaseFrame();
         }
+    }
 
-        if need_reinit {
-            let _ = init_duplications(g);
+    fn release(mut self) -> Result<()> {
+        self.released = true;
+        unsafe { self.duplication.ReleaseFrame() }
+    }
+}
+
+impl Drop for AcquiredFrame {
+    fn drop(&mut self) {
+        if !self.released {
+            unsafe {
+                let _ = self.duplication.ReleaseFrame();
+            }
         }
     }
 }
 
-unsafe fn render(g: &mut Globals, frag: &FragmentShader) {
-    unsafe {
-        capture_desktop_per_output(g);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::FilterMode;
 
-        let clear = [0.0f32, 0.0, 0.0, 0.0];
-        g.ctx.ClearRenderTargetView(&g.rtv, &clear);
-
-        g.ctx.VSSetShader(&g.vs, None);
-        g.ctx.PSSetShader(&frag.ps, None);
-        g.ctx.PSSetSamplers(0, Some(&[Some(g.sampler.clone())]));
-        g.ctx.IASetInputLayout(&g.input_layout);
-
-        let stride = size_of::<SimpleVertex>() as u32;
-        let offset = 0u32;
-        g.ctx.IASetVertexBuffers(
-            0,
-            1,
-            Some(&Some(g.vb.clone())),
-            Some(&stride),
-            Some(&offset),
-        );
-        g.ctx
-            .IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-
-        let virt_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
-        let virt_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        let virt_w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-        let virt_h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-
-        for od in &g.outputs {
-            let vp = D3D11_VIEWPORT {
-                TopLeftX: (od.desktop_rect.left - virt_left) as f32,
-                TopLeftY: (od.desktop_rect.top - virt_top) as f32,
-                Width: od.width as f32,
-                Height: od.height as f32,
-                MinDepth: 0.0,
-                MaxDepth: 1.0,
-            };
-            g.ctx.RSSetViewports(Some(&[vp]));
-
-            g.ctx
-                .PSSetShaderResources(0, Some(&[Some(od.dest_srv.clone())]));
-
-            g.ctx.Draw(4, 0);
-
-            g.ctx.PSSetShaderResources(0, Some(&[None]));
+    #[test]
+    #[ignore = "requires an interactive Windows desktop and capture permission"]
+    fn live_desktop_capture_and_resource_restart() {
+        let class = WindowClass::new().unwrap();
+        for iteration in 0..2 {
+            let factory = unsafe { CreateDXGIFactory1::<IDXGIFactory2>() }.unwrap();
+            let specs = MonitorSpec::enumerate(&factory).unwrap();
+            assert!(!specs.is_empty(), "An attached display is required");
+            for spec in specs {
+                let color = ColorState::read(spec.adapter_id, &spec.desc.DeviceName).unwrap();
+                match &color {
+                    ColorState::Advanced => eprintln!("{}: Advanced Color", spec.name()),
+                    ColorState::Legacy { path, .. } => {
+                        eprintln!("{}: ICC {}", spec.name(), path.display())
+                    }
+                }
+                let mut monitor = Monitor::new(
+                    &spec,
+                    color,
+                    &factory,
+                    &class,
+                    FilterMode::OklabGrayscale.fragment_shader(),
+                )
+                .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !monitor.ready && Instant::now() < deadline {
+                    assert!(class.process_messages());
+                    monitor.capture().unwrap();
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert!(monitor.ready, "{} iteration {iteration}", spec.name());
+                monitor.overlay.set_frozen(true).unwrap();
+                monitor.overlay.set_frozen(false).unwrap();
+            }
         }
-
-        let full = D3D11_VIEWPORT {
-            TopLeftX: 0.0,
-            TopLeftY: 0.0,
-            Width: virt_w as f32,
-            Height: virt_h as f32,
-            MinDepth: 0.0,
-            MaxDepth: 1.0,
-        };
-        g.ctx.RSSetViewports(Some(&[full]));
-
-        let _ = g.swap_chain.Present(0, DXGI_PRESENT::default());
     }
 }

@@ -1,6 +1,12 @@
 #![windows_subsystem = "windows"]
 
-use std::{fs::File, io::Write, path::Path, sync::atomic::Ordering, thread::JoinHandle};
+use std::{
+    fs::File,
+    io::Write,
+    path::Path,
+    sync::{Arc, atomic::Ordering},
+    thread::JoinHandle,
+};
 
 use auto_launch::AutoLaunch;
 use crossbeam_channel::Sender;
@@ -10,14 +16,14 @@ use win_hotkey::{HotkeyManager, HotkeyManagerImpl, InterruptHandle};
 use winreg::{RegKey, enums::HKEY_CURRENT_USER};
 use winrt_notification::Toast;
 
-use crate::{
-    config::Config,
-    render::{ENABLED, FROZEN},
-};
+use crate::{config::Config, render::FilterControl};
 
+mod color;
 mod config;
+mod gpu;
 mod render;
 mod update;
+mod window;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const APP_ID: &str = "ScreenFilter";
@@ -55,20 +61,21 @@ fn configure_auto_launch(config: &Config, path: &Path) -> AppResult<()> {
     Ok(())
 }
 
-fn configure_hotkeys(config: &Config) -> AppResult<HotkeyManager<()>> {
+fn configure_hotkeys(config: &Config, control: Arc<FilterControl>) -> AppResult<HotkeyManager<()>> {
     let mut manager = HotkeyManager::new();
+    let toggle_control = Arc::clone(&control);
     manager.register(
         config.toggle.vk,
         Some(&config.toggle.mods),
-        Some(|| {
-            ENABLED.fetch_xor(true, Ordering::Relaxed);
+        Some(move || {
+            toggle_control.enabled.fetch_xor(true, Ordering::Relaxed);
         }),
     )?;
     manager.register(
         config.freeze.vk,
         Some(&config.freeze.mods),
-        Some(|| {
-            FROZEN.fetch_xor(true, Ordering::Relaxed);
+        Some(move || {
+            control.frozen.fetch_xor(true, Ordering::Relaxed);
         }),
     )?;
     Ok(manager)
@@ -120,6 +127,7 @@ fn run() -> AppResult<()> {
     let config_receiver = config::watch_config(&path)?;
     let mut active = None::<EventLoop>;
     let mut last_config = None;
+    let control = Arc::new(FilterControl::default());
 
     while let Ok(config) = config_receiver.recv() {
         if last_config.as_ref() == Some(&config) {
@@ -130,7 +138,7 @@ fn run() -> AppResult<()> {
         if let Err(error) = configure_auto_launch(&config, &path) {
             log::warn!("Startup registration failed: {error}");
         }
-        match EventLoop::start(&config) {
+        match EventLoop::start(&config, Arc::clone(&control)) {
             Ok(event_loop) => {
                 active = Some(event_loop);
                 last_config = Some(config);
@@ -154,19 +162,14 @@ struct EventLoop {
 }
 
 impl EventLoop {
-    fn start(config: &Config) -> AppResult<Self> {
-        let manager = configure_hotkeys(config)?;
+    fn start(config: &Config, control: Arc<FilterControl>) -> AppResult<Self> {
+        let manager = configure_hotkeys(config, Arc::clone(&control))?;
         let interrupt = manager.interrupt_handle();
         let (stop, receiver) = crossbeam_channel::bounded(1);
         let fragment = config.mode.fragment_shader();
         let refresh_rate = config.refresh_rate;
         let render_thread = std::thread::spawn(move || {
-            let refresh_rate = if refresh_rate == 0 {
-                u32::MAX
-            } else {
-                refresh_rate
-            };
-            if let Err(error) = render::render_loop(fragment, refresh_rate, receiver) {
+            if let Err(error) = render::render_loop(fragment, refresh_rate, receiver, control) {
                 log::error!("Render loop failed: {error}");
                 notify("Screen Filter paused", &error.to_string());
             }
